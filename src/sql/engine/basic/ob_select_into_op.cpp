@@ -375,8 +375,13 @@ int ObSelectIntoOp::get_row_str(const int64_t buf_len,
     if (OB_SUCC(ret)) {
       ObObj cell;
       ObDatum *datum = NULL;
+      const ObString &csv_null_str = external_properties_.csv_format_.null_if_.count() > 0
+                                     ? external_properties_.csv_format_.null_if_.at(0)
+                                     : ObString();
       if (OB_FAIL(expr->eval(eval_ctx_, datum))) {
       } else if (OB_FAIL(datum->to_obj(cell, expr->obj_meta_))) {
+      } else if (cell.is_null() && !csv_null_str.empty()) {
+        ret = databuff_printf(buf, buf_len, pos, "%.*s", csv_null_str.length(), csv_null_str.ptr());
       } else if (OB_FAIL(cell.print_plain_str_literal(buf, buf_len, pos))) {
       } else if (0 != closed_cht && (!is_optional_ || ob_is_string_type(expr->datum_meta_.type_))) {
         if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%c", closed_cht))) {
@@ -942,6 +947,10 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
   char char_n = 'N';
+  // COPY (query) TO 'file' (nullstr 'x') renders a NULL as the requested string
+  const ObString &csv_null_str = external_properties_.csv_format_.null_if_.count() > 0
+                                 ? external_properties_.csv_format_.null_if_.at(0)
+                                 : ObString();
   const bool need_enclose = has_enclose_ && !obj.is_null()
                             && (!is_optional_ || obj.is_string_type() || obj.is_collection_sql_type()
                                 || obj.is_json() || obj.is_geometry() || obj.is_date()
@@ -952,6 +961,11 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   }
   if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
+  } else if (obj.is_null() && !csv_null_str.empty()) {
+    ObObj null_obj;
+    null_obj.set_varchar(csv_null_str);
+    null_obj.set_collation_type(cs_type_);
+    OZ(write_obj_to_file(null_obj, data_writer, false));
   } else if (obj.is_null()) {
     OZ(write_single_char_to_file(&char_escape_, data_writer));
     OZ(write_single_char_to_file(&char_n, data_writer));
