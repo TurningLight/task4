@@ -3158,6 +3158,26 @@ int ObSql::get_outline_data(ObPlanCacheCtx &pc_ctx,
   return ret;
 }
 
+// read_csv() / read_json() / read_parquet() / glob(): the columns of a file table are
+// inferred by scanning the file, so the generated plan depends on the file contents and
+// not only on the SQL text. A plan cached under the text (which contains the path) can be
+// reused after the file changed, or for a different file with the same path, and would
+// then read the wrong schema. Such statements are therefore never added to the plan cache.
+static bool contains_file_table_function(const ParseNode *node)
+{
+  bool found = false;
+  if (NULL != node) {
+    if (T_FILE_TABLE_EXPRESSION == node->type_) {
+      found = true;
+    } else {
+      for (int32_t i = 0; !found && i < node->num_child_; ++i) {
+        found = contains_file_table_function(node->children_[i]);
+      }
+    }
+  }
+  return found;
+}
+
 int ObSql::parser_and_check(const ObString &outlined_stmt,
                             ObExecContext &exec_ctx,
                             ObPlanCacheCtx &pc_ctx,
@@ -3258,7 +3278,9 @@ int ObSql::parser_and_check(const ObString &outlined_stmt,
               ret = OB_ERR_UNEXPECTED;
             } else {
               plan_cache->inc_access_cnt();
-              if (OB_SQL_PC_NOT_EXIST == get_plan_err) {
+              if (contains_file_table_function(parse_result.result_tree_)) {
+                add_plan_to_pc = false;
+              } else if (OB_SQL_PC_NOT_EXIST == get_plan_err) {
                 add_plan_to_pc = true;
               } else {
                 add_plan_to_pc = false;

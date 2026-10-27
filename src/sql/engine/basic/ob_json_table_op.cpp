@@ -21,6 +21,19 @@
 #include "sql/engine/expr/ob_expr_json_query.h"
 #include "common/xml/ob_binary_aggregate.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "common/timezone/ob_time_convert.h"
+
+// system headers first: ob_parquet_reader.h uses std::FILE without including <cstdio>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+
+#include "sql/engine/basic/file/ob_csv_scanner.h"
+#include "sql/engine/basic/file/ob_jsonl_scanner.h"
+#include "sql/engine/basic/file/ob_parquet_reader.h"
 
 namespace oceanbase
 {
@@ -46,6 +59,405 @@ const static int32_t JSN_EXIST_DEFAULT = 3;
     (jt_ctx_ptr)->is_cover_error_ = true; \
     (jt_ctx_ptr)->error_code_ = error_code; \
   } \
+}
+
+// ---------------------------------------------------------------------------
+// File table mode: read_csv / read_json / read_parquet / glob
+//
+// The resolver keeps the file path as the single const expression in
+// json_table_def_->doc_exprs_, which reaches the operator as
+// spec.value_exprs_.at(0) (ob_join_order.cpp appends it to JsonTablePath's
+// value_exprs_, and the code generator turns it into a runtime expression).
+// The inferred columns arrive as spec.cols_def_ in exactly the order the
+// scanner produced them, and their output expressions as spec.column_exprs_ --
+// but only for the columns the query actually references.
+//
+// The function name itself is not carried into the execute stage (it only
+// exists in the parse tree), so the scanner is selected from the path: a
+// wildcard pattern means glob(), a known file extension wins, otherwise the
+// file magic decides (PAR1 -> parquet, first non-blank byte '{' -> jsonl).
+// ---------------------------------------------------------------------------
+struct ObFileTableScanState
+{
+  enum Format
+  {
+    FMT_NONE = 0,
+    FMT_CSV,
+    FMT_JSONL,
+    FMT_PARQUET,
+    FMT_GLOB
+  };
+  ObFileTableScanState()
+    : fmt_(FMT_NONE), path_(), csv_(), jsonl_(), parquet_(),
+      parquet_cols_(), parquet_rows_(0), cur_row_(0),
+      files_(), cur_file_(0), csv_row_(), jsonl_row_(), col_cnt_(0) {}
+  ~ObFileTableScanState() {}
+
+  Format fmt_;
+  std::string path_;
+  ObCsvScanner csv_;
+  ObJsonlScanner jsonl_;
+  obparquet::Reader parquet_;
+  std::vector<obparquet::ColumnData> parquet_cols_;
+  int64_t parquet_rows_;
+  int64_t cur_row_;
+  std::vector<std::string> files_;
+  int64_t cur_file_;
+  std::vector<ObCsvValue> csv_row_;
+  std::vector<ObJsonlValue> jsonl_row_;
+  int64_t col_cnt_;
+};
+
+// '*' matches any run of characters, '?' exactly one.
+static bool fs_glob_match(const char *pat, const char *name)
+{
+  bool matched = true;
+  const char *star_pat = NULL;  // pattern position just after the last '*'
+  const char *star_name = NULL; // name position that '*' was matched against
+  while ('\0' != *name) {
+    if ('*' == *pat) {
+      star_pat = ++pat;
+      star_name = name;
+    } else if ('?' == *pat || *pat == *name) {
+      ++pat;
+      ++name;
+    } else if (NULL != star_pat) {
+      pat = star_pat;
+      name = ++star_name;
+    } else {
+      matched = false;
+      break;
+    }
+  }
+  if (matched) {
+    while ('*' == *pat) {
+      ++pat;
+    }
+    matched = ('\0' == *pat);
+  }
+  return matched;
+}
+
+static bool fs_has_glob_meta(const std::string &path)
+{
+  return std::string::npos != path.find('*') || std::string::npos != path.find('?');
+}
+
+static bool fs_ends_with(const std::string &path, const char *suffix)
+{
+  const size_t len = std::strlen(suffix);
+  if (path.size() < len) {
+    return false;
+  }
+  return 0 == path.compare(path.size() - len, len, suffix);
+}
+
+// Lower-cased copy of the extension (including the dot), empty when there is none.
+static std::string fs_extension(const std::string &path)
+{
+  std::string ext;
+  const std::string::size_type slash = path.find_last_of('/');
+  const std::string::size_type dot = path.find_last_of('.');
+  if (std::string::npos != dot && (std::string::npos == slash || dot > slash)) {
+    ext = path.substr(dot);
+  }
+  for (size_t i = 0; i < ext.size(); ++i) {
+    ext[i] = static_cast<char>(::tolower(static_cast<unsigned char>(ext[i])));
+  }
+  return ext;
+}
+
+static ObFileTableScanState::Format fs_sniff_format(const std::string &path)
+{
+  ObFileTableScanState::Format fmt = ObFileTableScanState::FMT_CSV;
+  std::FILE *file = std::fopen(path.c_str(), "rb");
+  if (NULL != file) {
+    char buf[8] = {0};
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, file);
+    std::fclose(file);
+    if (n >= 4 && 0 == std::memcmp(buf, "PAR1", 4)) {
+      fmt = ObFileTableScanState::FMT_PARQUET;
+    } else {
+      size_t i = 0;
+      while (i < n && (' ' == buf[i] || '\t' == buf[i] || '\r' == buf[i] || '\n' == buf[i])) {
+        ++i;
+      }
+      fmt = (i < n && '{' == buf[i]) ? ObFileTableScanState::FMT_JSONL
+                                     : ObFileTableScanState::FMT_CSV;
+    }
+  }
+  return fmt;
+}
+
+static ObFileTableScanState::Format fs_detect_format(const std::string &path)
+{
+  ObFileTableScanState::Format fmt = ObFileTableScanState::FMT_NONE;
+  const std::string ext = fs_extension(path);
+  if (fs_has_glob_meta(path)) {
+    fmt = ObFileTableScanState::FMT_GLOB;
+  } else if (".csv" == ext || ".tsv" == ext || ".txt" == ext) {
+    fmt = ObFileTableScanState::FMT_CSV;
+  } else if (".jsonl" == ext || ".ndjson" == ext || ".json" == ext) {
+    fmt = ObFileTableScanState::FMT_JSONL;
+  } else if (".parquet" == ext || ".parq" == ext || ".pq" == ext) {
+    fmt = ObFileTableScanState::FMT_PARQUET;
+  } else if (fs_ends_with(path, "/")) {
+    fmt = ObFileTableScanState::FMT_NONE;
+  } else {
+    fmt = fs_sniff_format(path);
+  }
+  return fmt;
+}
+
+static int fs_glob_collect(const std::string &pattern, std::vector<std::string> *out)
+{
+  int ret = OB_SUCCESS;
+  std::string dir;
+  std::string file_pat;
+  const std::string::size_type slash = pattern.find_last_of('/');
+  if (std::string::npos == slash) {
+    dir = ".";
+    file_pat = pattern;
+  } else {
+    dir = pattern.substr(0, slash);
+    file_pat = pattern.substr(slash + 1);
+    if (dir.empty()) {
+      dir = "/";
+    }
+  }
+  if (file_pat.empty()) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("glob pattern has no file name part", "pattern", pattern.c_str());
+  } else {
+    DIR *dirp = ::opendir(dir.c_str());
+    if (NULL == dirp) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("open directory failed", "dir", dir.c_str());
+    } else {
+      struct dirent *ent = NULL;
+      while (NULL != (ent = ::readdir(dirp))) {
+        if (0 == std::strcmp(ent->d_name, ".") || 0 == std::strcmp(ent->d_name, "..")) {
+          continue;
+        }
+        if (!fs_glob_match(file_pat.c_str(), ent->d_name)) {
+          continue;
+        }
+        std::string full = dir;
+        if ('/' != full[full.length() - 1]) {
+          full += "/";
+        }
+        full += ent->d_name;
+        struct stat st;
+        if (0 != ::stat(full.c_str(), &st) || !S_ISREG(st.st_mode)) {
+          continue;
+        }
+        out->push_back(full);
+      }
+      ::closedir(dirp);
+      // deterministic order for reproducible results
+      std::sort(out->begin(), out->end());
+    }
+  }
+  return ret;
+}
+
+// The resolver inferred the plan schema with the pinned defaults (header present,
+// sample the whole file); the runtime pass has to reproduce it column by column,
+// so the same defaults are used here.
+static int fs_open_csv_scan(ObFileTableScanState *state)
+{
+  int ret = OB_SUCCESS;
+  std::string err;
+  state->csv_.set_header(true);
+  state->csv_.set_sample_size(-1);
+  if (!state->csv_.open(state->path_, &err)) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("open csv file failed", "path", state->path_.c_str(), "err", err.c_str());
+  } else if (!state->csv_.infer_schema(&err)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("infer csv schema failed", "path", state->path_.c_str(), "err", err.c_str());
+  }
+  return ret;
+}
+
+static int fs_open_jsonl_scan(ObFileTableScanState *state)
+{
+  int ret = OB_SUCCESS;
+  std::string err;
+  state->jsonl_.set_sample_size(-1);
+  if (!state->jsonl_.open(state->path_, &err)) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("open jsonl file failed", "path", state->path_.c_str(), "err", err.c_str());
+  } else if (!state->jsonl_.infer_schema(&err)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("infer jsonl schema failed", "path", state->path_.c_str(), "err", err.c_str());
+  }
+  return ret;
+}
+
+static int fs_open_parquet_scan(ObFileTableScanState *state)
+{
+  int ret = OB_SUCCESS;
+  std::string err;
+  if (!state->parquet_.Open(state->path_, &err)) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("open parquet file failed", "path", state->path_.c_str(), "err", err.c_str());
+  } else {
+    const size_t column_count = state->parquet_.columns().size();
+    state->parquet_cols_.clear();
+    state->parquet_cols_.resize(column_count);
+    // The reader materialises one whole column at a time (column-at-a-time, not
+    // row-at-a-time): every projected column is decoded once here and rows are
+    // then served from memory. Correct for M1, but memory is O(file) per column;
+    // a row-group iterator is the fix for very large files.
+    for (size_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+      if (!state->parquet_.ReadColumn(i, &state->parquet_cols_[i], &err)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("read parquet column failed", "path", state->path_.c_str(),
+                 "column", i, "err", err.c_str());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      state->parquet_rows_ = state->parquet_.NumRows();
+      state->cur_row_ = 0;
+    }
+  }
+  return ret;
+}
+
+// spec.cols_def_.at(j)->output_column_idx_ is rewritten by the code generator to the
+// index of this column's expression in spec.column_exprs_ -- but only for columns the
+// query actually references (count(*) references none). Unreferenced columns keep the
+// resolver-time value, i.e. the column id (OB_APP_MIN_COLUMN_ID + j), which is out of
+// range for any realistic column count and therefore read as "not projected".
+static ObExpr *fs_target_expr(const ObJsonTableSpec &spec, int64_t col_idx)
+{
+  ObExpr *expr = NULL;
+  if (col_idx >= 0 && col_idx < spec.cols_def_.count()) {
+    const int64_t expr_idx = spec.cols_def_.at(col_idx)->output_column_idx_;
+    if (expr_idx >= 0 && expr_idx < spec.column_exprs_.count()) {
+      expr = spec.column_exprs_.at(expr_idx);
+    }
+  }
+  return expr;
+}
+
+// NOTE: the varchar payload points into the scanner's row buffer, which stays valid
+// until the next next_row() call. That is enough here because this operator is not
+// vectorized (ObOpSpec::is_vectorized() == false for PHY_JSON_TABLE), so the framework
+// pulls exactly one row per batch and consumes it before asking for the next one.
+static int fs_write_csv_value(ObEvalCtx &ctx, ObExpr *expr, const ObCsvValue &value,
+                              const ObTimeConvertCtx &cvrt_ctx)
+{
+  int ret = OB_SUCCESS;
+  ObDatum &datum = expr->locate_datum_for_write(ctx);
+  if (value.is_null) {
+    datum.set_null();
+  } else {
+    switch (value.type) {
+      case OB_CSV_TYPE_BIGINT:
+        datum.set_int(value.int_value);
+        break;
+      case OB_CSV_TYPE_DOUBLE:
+        datum.set_double(value.double_value);
+        break;
+      case OB_CSV_TYPE_BOOLEAN:
+        datum.set_bool(value.bool_value);
+        break;
+      case OB_CSV_TYPE_DATE: {
+        int32_t date_value = 0;
+        const ObString text(static_cast<int32_t>(value.string_value.size()),
+                            value.string_value.c_str());
+        if (OB_FAIL(ObTimeConverter::str_to_date(text, date_value))) {
+          LOG_WARN("convert csv date failed", K(text), K(ret));
+          datum.set_null();
+          ret = OB_SUCCESS;
+        } else {
+          datum.set_date(date_value);
+        }
+        break;
+      }
+      case OB_CSV_TYPE_DATETIME: {
+        int64_t datetime_value = 0;
+        const ObString text(static_cast<int32_t>(value.string_value.size()),
+                            value.string_value.c_str());
+        if (OB_FAIL(ObTimeConverter::str_to_datetime(text, cvrt_ctx, datetime_value))) {
+          LOG_WARN("convert csv datetime failed", K(text), K(ret));
+          datum.set_null();
+          ret = OB_SUCCESS;
+        } else {
+          datum.set_datetime(datetime_value);
+        }
+        break;
+      }
+      case OB_CSV_TYPE_VARCHAR:
+      case OB_CSV_TYPE_SQL_NULL:
+      default:
+        datum.set_string(value.string_value.c_str(),
+                         static_cast<uint32_t>(value.string_value.size()));
+        break;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    expr->get_eval_info(ctx).evaluated_ = true;
+  }
+  return ret;
+}
+
+static int fs_write_jsonl_value(ObEvalCtx &ctx, ObExpr *expr, const ObJsonlValue &value)
+{
+  int ret = OB_SUCCESS;
+  ObDatum &datum = expr->locate_datum_for_write(ctx);
+  if (value.is_null) {
+    datum.set_null();
+  } else {
+    switch (value.type) {
+      case OB_JSONL_TYPE_BIGINT:
+        datum.set_int(value.int_value);
+        break;
+      case OB_JSONL_TYPE_DOUBLE:
+        datum.set_double(value.double_value);
+        break;
+      case OB_JSONL_TYPE_BOOLEAN:
+        datum.set_bool(value.bool_value);
+        break;
+      case OB_JSONL_TYPE_VARCHAR:
+      case OB_JSONL_TYPE_SQL_NULL:
+      default:
+        datum.set_string(value.string_value.c_str(),
+                         static_cast<uint32_t>(value.string_value.size()));
+        break;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    expr->get_eval_info(ctx).evaluated_ = true;
+  }
+  return ret;
+}
+
+static int fs_write_parquet_value(ObEvalCtx &ctx, ObExpr *expr,
+                                  const obparquet::ColumnData &column, int64_t row)
+{
+  int ret = OB_SUCCESS;
+  ObDatum &datum = expr->locate_datum_for_write(ctx);
+  const bool is_null = row >= static_cast<int64_t>(column.is_null.size())
+                       || 0 != column.is_null.at(static_cast<size_t>(row));
+  if (is_null) {
+    datum.set_null();
+  } else if (row < static_cast<int64_t>(column.values.size())) {
+    datum.set_int(column.values.at(static_cast<size_t>(row)));
+  } else if (row < static_cast<int64_t>(column.doubles.size())) {
+    datum.set_double(column.doubles.at(static_cast<size_t>(row)));
+  } else if (row < static_cast<int64_t>(column.bytes.size())) {
+    const std::string &text = column.bytes.at(static_cast<size_t>(row));
+    datum.set_string(text.c_str(), static_cast<uint32_t>(text.size()));
+  } else {
+    datum.set_null();
+  }
+  if (OB_SUCC(ret)) {
+    expr->get_eval_info(ctx).evaluated_ = true;
+  }
+  return ret;
 }
 
 #define EVAL_COVER_CODE(jt_ctx_ptr, error_code) \
@@ -334,6 +746,15 @@ OB_DEF_SERIALIZE(ObJsonTableSpec)
       OB_UNIS_ENCODE(value_exprs_.at(i));
     }
   }
+
+  // File tables (read_csv/read_json/read_parquet/glob) are a fourth mode. Their
+  // whole payload is value_exprs_.at(0) (the path) plus column_exprs_/cols_def_,
+  // all encoded above, so the only extra wire field is the mode itself. Appending
+  // it unconditionally after the mode-specific blocks keeps the json-table and
+  // unnest encodings unchanged apart from this trailing int32, and keeps
+  // encode/serialize_size/deserialize symmetric for the file case.
+  int32_t ser_table_type = static_cast<int32_t>(table_type_);
+  OB_UNIS_ENCODE(ser_table_type);
   
   return ret;
 }
@@ -362,6 +783,9 @@ OB_DEF_SERIALIZE_SIZE(ObJsonTableSpec)
       OB_UNIS_ADD_LEN(value_exprs_.at(i));
     }
   }
+  // trailing file-table mode flag, see OB_DEF_SERIALIZE(ObJsonTableSpec)
+  int32_t ser_table_type = static_cast<int32_t>(table_type_);
+  OB_UNIS_ADD_LEN(ser_table_type);
   return len;
 }
 
@@ -415,6 +839,16 @@ OB_DEF_DESERIALIZE(ObJsonTableSpec)
     }
   } else if (OB_FAIL(value_exprs_.init(1))) {
   } else if (OB_FAIL(value_exprs_.push_back(value_expr))) {
+  }
+
+  // trailing file-table mode flag, see OB_DEF_SERIALIZE(ObJsonTableSpec)
+  int32_t ser_table_type = 0;
+  if (OB_FAIL(ret)) {
+  } else {
+    OB_UNIS_DECODE(ser_table_type);
+    if (ser_table_type == static_cast<int32_t>(MulModeTableType::OB_FILE_TABLE_TYPE)) {
+      table_type_ = MulModeTableType::OB_FILE_TABLE_TYPE;
+    }
   }
   return ret;
 }
@@ -587,6 +1021,12 @@ int ObJsonTableOp::inner_open()
   if (OB_FAIL(init())) {
   } else if (MY_SPEC.value_exprs_.empty()) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (jt_ctx_.is_file_table_func()) {
+    // file mode: no json/unnest exec tree, the scanner is opened instead
+    if (OB_FAIL(open_file_scan())) {
+    } else {
+      is_evaled_ = false;
+    }
   } else if (OB_FAIL(root_->open(&jt_ctx_))) {
   } else {
     is_evaled_ = false;
@@ -618,6 +1058,12 @@ int ObJsonTableOp::reset_variable()
   if (OB_FAIL(ret)) {
   } else if (MY_SPEC.value_exprs_.empty()) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (jt_ctx_.is_file_table_func()) {
+    // file mode has no json/unnest root to reset; rewind or reopen the scanner
+    if (OB_FAIL(reset_file_scan())) {
+    } else {
+      is_evaled_ = false;
+    }
   } else if (OB_FAIL(root_->reset(&jt_ctx_))) {
   } else {
     is_evaled_ = false;
@@ -639,7 +1085,25 @@ int ObJsonTableOp::init()
   if (!is_inited_) {
     const ObJsonTableSpec* spec_ptr = reinterpret_cast<const ObJsonTableSpec*>(&spec_);
     jt_ctx_.spec_ptr_ = const_cast<ObJsonTableSpec*>(spec_ptr);
-    if (OB_FAIL(generate_table_exec_tree())) {
+    if (jt_ctx_.is_file_table_func()) {
+      // File mode: no json document to shred, so no exec tree and no table func
+      // object. The shared JtScanCtx fields are still initialised because the
+      // datum writers use eval_ctx_ and row_alloc_ lives there.
+      const sql::ObSQLSessionInfo *session = get_exec_ctx().get_my_session();
+      if (OB_ISNULL(session)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        is_inited_ = true;
+        jt_ctx_.eval_ctx_ = &eval_ctx_;
+        jt_ctx_.exec_ctx_ = &get_exec_ctx();
+        jt_ctx_.op_exec_alloc_ = allocator_;
+        jt_ctx_.is_evaled_ = false;
+        jt_ctx_.is_charset_converted_ = false;
+        jt_ctx_.res_obj_ = nullptr;
+        jt_ctx_.jt_op_ = this;
+        jt_ctx_.is_const_input_ = !MY_SPEC.has_correlated_expr_;
+      }
+    } else if (OB_FAIL(generate_table_exec_tree())) {
     } else {
       const sql::ObSQLSessionInfo *session = get_exec_ctx().get_my_session();
       if (OB_ISNULL(session)) {
@@ -697,6 +1161,7 @@ int ObJsonTableOp::inner_close()
   if (OB_NOT_NULL(jt_ctx_.table_func_) && OB_NOT_NULL(jt_ctx_.op_exec_alloc_)) {
     jt_ctx_.op_exec_alloc_->free(jt_ctx_.table_func_);
   }
+  destroy_file_scan();
   return ret;
 }
 
@@ -722,6 +1187,7 @@ void ScanNode::reset_reg_columns(JtScanCtx* ctx)
 
 void ObJsonTableOp::destroy()
 {
+  destroy_file_scan();
   ObOperator::destroy();
 }
 
@@ -1402,7 +1868,11 @@ int ObJsonTableOp::inner_get_next_row()
 {
   INIT_SUCC(ret);
   bool is_root_null = false;
-  if (!(jt_ctx_.is_json_table_func()
+  // file table mode is dispatched before the json/unnest check: it never builds a
+  // root_ or a table_func_, and must not touch either.
+  if (jt_ctx_.is_file_table_func()) {
+    ret = inner_get_next_row_file();
+  } else if (!(jt_ctx_.is_json_table_func()
         || jt_ctx_.is_unnest_table_func())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (is_evaled_) {
@@ -1424,6 +1894,200 @@ int ObJsonTableOp::inner_get_next_row()
     }
   }
 
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// File table mode (read_csv / read_json / read_parquet / glob)
+// ---------------------------------------------------------------------------
+
+int ObJsonTableOp::open_file_scan()
+{
+  INIT_SUCC(ret);
+  const ObJsonTableSpec &spec = MY_SPEC;
+  ObDatum *path_datum = NULL;
+  ObString path;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json table op is not inited", K(ret));
+  } else if (OB_ISNULL(file_state_)) {
+    void *buf = NULL;
+    if (OB_ISNULL(allocator_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("operator allocator is null", K(ret));
+    } else if (OB_ISNULL(buf = allocator_->alloc(sizeof(ObFileTableScanState)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate file scan state failed", K(ret));
+    } else {
+      file_state_ = new (buf) ObFileTableScanState();
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(spec.value_exprs_.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file table has no path expression", K(ret));
+  } else if (OB_FAIL(spec.value_exprs_.at(0)->eval(eval_ctx_, path_datum))) {
+    LOG_WARN("evaluate file path expression failed", K(ret));
+  } else if (OB_ISNULL(path_datum) || path_datum->is_null()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file path is null", K(ret));
+  } else if (FALSE_IT(path = path_datum->get_string())) {
+  } else if (OB_UNLIKELY(path.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file path is empty", K(ret));
+  } else {
+    file_state_->path_.assign(path.ptr(), static_cast<size_t>(path.length()));
+    file_state_->fmt_ = fs_detect_format(file_state_->path_);
+    file_state_->col_cnt_ = spec.cols_def_.count();
+    file_state_->cur_row_ = 0;
+    file_state_->cur_file_ = 0;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (ObFileTableScanState::FMT_GLOB == file_state_->fmt_) {
+    ret = fs_glob_collect(file_state_->path_, &file_state_->files_);
+  } else if (ObFileTableScanState::FMT_CSV == file_state_->fmt_) {
+    ret = fs_open_csv_scan(file_state_);
+  } else if (ObFileTableScanState::FMT_JSONL == file_state_->fmt_) {
+    ret = fs_open_jsonl_scan(file_state_);
+  } else if (ObFileTableScanState::FMT_PARQUET == file_state_->fmt_) {
+    ret = fs_open_parquet_scan(file_state_);
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("cannot detect file table format", "path", file_state_->path_.c_str());
+  }
+  LOG_TRACE("open file scan", K(ret), "path", file_state_->path_.c_str());
+  return ret;
+}
+
+int ObJsonTableOp::reset_file_scan()
+{
+  INIT_SUCC(ret);
+  if (OB_ISNULL(file_state_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("file scan state is null", K(ret));
+  } else if (ObFileTableScanState::FMT_GLOB == file_state_->fmt_) {
+    file_state_->cur_file_ = 0;
+  } else if (ObFileTableScanState::FMT_PARQUET == file_state_->fmt_) {
+    file_state_->cur_row_ = 0;
+  } else if (ObFileTableScanState::FMT_CSV == file_state_->fmt_) {
+    file_state_->csv_.close();
+    ret = fs_open_csv_scan(file_state_);
+  } else if (ObFileTableScanState::FMT_JSONL == file_state_->fmt_) {
+    file_state_->jsonl_.close();
+    ret = fs_open_jsonl_scan(file_state_);
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("cannot reset file scan", "path", file_state_->path_.c_str());
+  }
+  return ret;
+}
+
+void ObJsonTableOp::destroy_file_scan()
+{
+  if (OB_NOT_NULL(file_state_)) {
+    file_state_->csv_.close();
+    file_state_->jsonl_.close();
+    file_state_->parquet_.Close();
+    file_state_->~ObFileTableScanState();
+    if (OB_NOT_NULL(allocator_)) {
+      allocator_->free(file_state_);
+    }
+    file_state_ = nullptr;
+  }
+}
+
+int ObJsonTableOp::inner_get_next_row_file()
+{
+  INIT_SUCC(ret);
+  const ObJsonTableSpec &spec = MY_SPEC;
+  const ObSQLSessionInfo *session = get_exec_ctx().get_my_session();
+  const ObTimeZoneInfo *tz_info = NULL;
+  std::string err;
+  if (NULL != session) {
+    tz_info = session->get_timezone_info();
+  }
+  const ObTimeConvertCtx cvrt_ctx(tz_info, false);
+  if (OB_ISNULL(file_state_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file scan state is null", K(ret));
+  } else {
+    clear_evaluated_flag();
+    if (ObFileTableScanState::FMT_CSV == file_state_->fmt_) {
+      if (!file_state_->csv_.next_row(&file_state_->csv_row_, &err)) {
+        if (file_state_->csv_.eof()) {
+          ret = OB_ITER_END;
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("read csv row failed", K(ret), "path", file_state_->path_.c_str(),
+                   "err", err.c_str());
+        }
+      } else {
+        const int64_t value_count = static_cast<int64_t>(file_state_->csv_row_.size());
+        for (int64_t i = 0; OB_SUCC(ret) && i < value_count; ++i) {
+          ObExpr *expr = fs_target_expr(spec, i);
+          if (NULL != expr && OB_FAIL(fs_write_csv_value(eval_ctx_, expr,
+                                                         file_state_->csv_row_.at(static_cast<size_t>(i)),
+                                                         cvrt_ctx))) {
+            LOG_WARN("write csv value failed", K(ret), K(i));
+          }
+        }
+      }
+    } else if (ObFileTableScanState::FMT_JSONL == file_state_->fmt_) {
+      if (!file_state_->jsonl_.next_row(&file_state_->jsonl_row_, &err)) {
+        if (file_state_->jsonl_.eof()) {
+          ret = OB_ITER_END;
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("read jsonl row failed", K(ret), "path", file_state_->path_.c_str(),
+                   "err", err.c_str());
+        }
+      } else {
+        const int64_t value_count = static_cast<int64_t>(file_state_->jsonl_row_.size());
+        for (int64_t i = 0; OB_SUCC(ret) && i < value_count; ++i) {
+          ObExpr *expr = fs_target_expr(spec, i);
+          if (NULL != expr && OB_FAIL(fs_write_jsonl_value(eval_ctx_, expr,
+                                                           file_state_->jsonl_row_.at(static_cast<size_t>(i))))) {
+            LOG_WARN("write jsonl value failed", K(ret), K(i));
+          }
+        }
+      }
+    } else if (ObFileTableScanState::FMT_PARQUET == file_state_->fmt_) {
+      if (file_state_->cur_row_ >= file_state_->parquet_rows_) {
+        ret = OB_ITER_END;
+      } else {
+        const int64_t row = file_state_->cur_row_;
+        const int64_t column_count = static_cast<int64_t>(file_state_->parquet_cols_.size());
+        for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+          ObExpr *expr = fs_target_expr(spec, i);
+          if (NULL != expr && OB_FAIL(fs_write_parquet_value(eval_ctx_, expr,
+                                                             file_state_->parquet_cols_.at(static_cast<size_t>(i)),
+                                                             row))) {
+            LOG_WARN("write parquet value failed", K(ret), K(i), K(row));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ++file_state_->cur_row_;
+        }
+      }
+    } else if (ObFileTableScanState::FMT_GLOB == file_state_->fmt_) {
+      if (file_state_->cur_file_ >= static_cast<int64_t>(file_state_->files_.size())) {
+        ret = OB_ITER_END;
+      } else {
+        // glob() has exactly one VARCHAR column named `file`
+        ObExpr *expr = fs_target_expr(spec, 0);
+        if (NULL != expr) {
+          const std::string &file = file_state_->files_.at(static_cast<size_t>(file_state_->cur_file_));
+          ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+          datum.set_string(file.c_str(), static_cast<uint32_t>(file.size()));
+          expr->get_eval_info(eval_ctx_).evaluated_ = true;
+        }
+        ++file_state_->cur_file_;
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unknown file table format", K(ret), "path", file_state_->path_.c_str());
+    }
+  }
   return ret;
 }
 
