@@ -1593,7 +1593,9 @@ bool ObAIFuncPromptObjectUtils::is_valid_prompt_object(ObJsonObject *prompt_obje
       ObJsonNode *node = args_array->get_value(i);
       if (OB_ISNULL(node)) {  
         is_valid = false;
-      } else if (node->json_type() != ObJsonNodeType::J_STRING && node->json_type() != ObJsonNodeType::J_OBJECT) {
+      } else if (node->json_type() != ObJsonNodeType::J_STRING
+                 && node->json_type() != ObJsonNodeType::J_OBJECT
+                 && node->json_type() != ObJsonNodeType::J_ARRAY) {
         is_valid = false;
       }
     }
@@ -1617,15 +1619,41 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
   } else {
     uint64_t args_count = args_array->element_count();
     int64_t max_result_len = template_str.length();
+    int64_t max_arg_len = 0;
+    int64_t placeholder_bound = 0;
     char *result_buf = NULL;
     for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
       ObJsonNode *arg_node = args_array->get_value(i);
       if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
         ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-        max_result_len += arg_str->get_str().length();
+        const int64_t arg_len = arg_str->get_str().length();
+        if (arg_len > max_arg_len) {
+          max_arg_len = arg_len;
+        }
+      } else if (OB_NOT_NULL(arg_node)) {
+        // Non-string arguments (JSON object/array/scalar) expand as their JSON
+        // text so a prompt can carry structured values.
+        ObJsonBuffer node_buf(&allocator);
+        if (OB_FAIL(arg_node->print(node_buf, false))) {
+        } else if (node_buf.length() > max_arg_len) {
+          max_arg_len = node_buf.length();
+        }
       } else {
         ret = OB_INVALID_ARGUMENT;
       }
+    }
+    // A placeholder may appear more than once, so the same argument can be
+    // expanded several times. Bound the result by the number of '{' in the
+    // template times the longest argument instead of counting each argument
+    // once (which under-estimated the buffer and returned OB_BUF_NOT_ENOUGH).
+    if (OB_SUCC(ret)) {
+      const char *tpl_ptr = template_str.ptr();
+      for (int64_t i = 0; i < template_str.length(); i++) {
+        if (tpl_ptr[i] == '{') {
+          placeholder_bound++;
+        }
+      }
+      max_result_len += placeholder_bound * max_arg_len;
     }
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len)))) {
@@ -1666,18 +1694,28 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
             
             if (valid_index && index >= 0 && static_cast<uint64_t>(index) < args_count) {
               ObJsonNode *arg_node = args_array->get_value(static_cast<uint64_t>(index));
-              if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
-                ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-                ObString arg_value = arg_str->get_str();
-                
-                if (result_pos + arg_value.length() <= max_result_len) {
-                  MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
-                  result_pos += arg_value.length();
-                } else {
-                  ret = OB_BUF_NOT_ENOUGH;
-                }
+              ObString arg_value;
+              if (OB_ISNULL(arg_node)) {
+                ret = OB_INVALID_ARGUMENT;
+              } else if (arg_node->json_type() == ObJsonNodeType::J_STRING) {
+                arg_value = static_cast<ObJsonString *>(arg_node)->get_str();
               } else {
-                //do nothing
+                // Structured values expand as textual JSON so the model sees
+                // {"text":"..."} instead of the binary JSON encoding.
+                ObJsonBuffer node_buf(&allocator);
+                if (OB_FAIL(arg_node->print(node_buf, false))) {
+                } else {
+                  arg_value.assign_ptr(node_buf.ptr(), static_cast<int32_t>(node_buf.length()));
+                }
+              }
+              if (OB_FAIL(ret)) {
+              } else if (result_pos + arg_value.length() <= max_result_len) {
+                if (arg_value.length() > 0) {
+                  MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
+                }
+                result_pos += arg_value.length();
+              } else {
+                ret = OB_BUF_NOT_ENOUGH;
               }
               
               i = end_pos;
