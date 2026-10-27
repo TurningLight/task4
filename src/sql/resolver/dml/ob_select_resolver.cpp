@@ -3081,6 +3081,114 @@ int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
   return ret;
 }
 
+// COPY (query) TO 'file' (options) is executed through the SELECT ... INTO OUTFILE
+// machinery: this rewrites the copy options into an ObSelectIntoItem holding a CSV
+// ObExternalFileFormat plus the header line to emit.
+int ObSelectResolver::resolve_copy_into(const ParseNode &node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  ObExternalFileFormat external_format;
+  const ParseNode *option_list = NULL;
+  const ParseNode *option_node = NULL;
+  const ParseNode *value_node = NULL;
+  bool has_header = false;
+  ObString null_str;
+  ObString field_term;
+  into_item.into_type_ = T_INTO_OUTFILE;
+  if (OB_UNLIKELY(node.num_child_ < 1) || OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid copy into parse node", K(ret), K(node.num_child_));
+  } else if (OB_FAIL(resolve_into_const_node(node.children_[0], into_item.outfile_name_))) {
+    LOG_WARN("failed to resolve the copy outfile path", K(ret));
+  }
+  // options: (format csv, header, nullstr 'NULL', delimiter '|', ...)
+  if (OB_SUCC(ret) && node.num_child_ > 1 && NULL != (option_list = node.children_[1])) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < option_list->num_child_; ++i) {
+      if (OB_ISNULL(option_node = option_list->children_[i])
+          || OB_UNLIKELY(1 != option_node->num_child_)
+          || OB_ISNULL(value_node = option_node->children_[0])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid copy option parse node", K(ret), K(i));
+      } else if (T_EXTERNAL_FILE_FORMAT_TYPE == option_node->type_) {
+        ObString csv_name;
+        ObString format_name(value_node->str_len_, value_node->str_value_);
+        csv_name.assign_ptr("csv", 3);
+        if (0 != format_name.case_compare(csv_name)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "copy format other than csv");
+        }
+      } else if (T_PARSE_HEADER == option_node->type_) {
+        has_header = (0 != value_node->value_);
+      } else if (T_NULL_IF_EXETERNAL == option_node->type_) {
+        null_str.assign_ptr(value_node->str_value_, value_node->str_len_);
+      } else if (T_FIELD_TERMINATED_STR == option_node->type_) {
+        field_term.assign_ptr(value_node->str_value_, value_node->str_len_);
+      } else {
+        // unreachable: the grammar only produces the options handled above
+        ret = OB_ERR_PARSE_SQL;
+        LOG_WARN("unknown copy option", K(ret), K(option_node->type_));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && field_term.empty()) {
+    field_term.assign_ptr(",", 1);
+  }
+  // build the csv format and serialize it, exactly like INTO OUTFILE ... FORMAT does
+  if (OB_SUCC(ret)) {
+    ObCollationType file_cs_type = ObCharset::get_system_collation();
+    external_format.format_type_ = ObExternalFileFormat::CSV_FORMAT;
+    external_format.options_ = 0;
+    if (OB_FAIL(external_format.csv_format_.init_format(ObDataInFileStruct(), 0, file_cs_type))) {
+      LOG_WARN("failed to init the csv format", K(ret));
+    } else {
+      external_format.csv_format_.field_term_str_ = field_term;
+      external_format.csv_format_.line_term_str_.assign_ptr("\n", 1);
+      external_format.csv_format_.field_enclosed_char_ = INT64_MAX; // no enclosure
+      external_format.csv_format_.parse_header_ = has_header;
+      external_format.csv_format_.is_optional_ = false;
+      if (!null_str.empty()) {
+        if (OB_FAIL(external_format.csv_format_.null_if_.allocate_array(*allocator_, 1))) {
+          LOG_WARN("failed to allocate the null if array", K(ret));
+        } else {
+          external_format.csv_format_.null_if_.at(0) = null_str;
+        }
+      }
+      if (OB_SUCC(ret)
+          && OB_FAIL(external_format.to_string_with_alloc(into_item.external_properties_,
+                                                          *allocator_, true))) {
+        LOG_WARN("failed to serialize the csv format", K(ret));
+      }
+    }
+  }
+  // the header line for COPY ... (header)
+  if (OB_SUCC(ret) && has_header) {
+    ObSqlString header;
+    const ObIArray<SelectItem> &select_items = get_select_stmt()->get_select_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_items.count(); ++i) {
+      const SelectItem &item = select_items.at(i);
+      ObString name = item.is_real_alias_ ? item.alias_name_ : item.expr_name_;
+      if (name.empty()) {
+        name = item.alias_name_;
+      }
+      if (name.empty() && NULL != item.expr_ && T_REF_COLUMN == item.expr_->get_expr_type()) {
+        name = static_cast<const ObColumnRefRawExpr *>(item.expr_)->get_column_name();
+      }
+      if (i > 0 && OB_FAIL(header.append_fmt("%.*s", field_term.length(), field_term.ptr()))) {
+        LOG_WARN("failed to append the field delimiter", K(ret));
+      } else if (OB_FAIL(header.append_fmt("%.*s", name.length(), name.ptr()))) {
+        LOG_WARN("failed to append a header column name", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(header.append("\n"))) {
+      LOG_WARN("failed to append the line delimiter", K(ret));
+    } else if (OB_SUCC(ret)
+               && OB_FAIL(ob_write_string(*allocator_, header.string(), into_item.column_names_))) {
+      LOG_WARN("failed to store the copy header line", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_clause(const ParseNode *node)
 {
   int ret = OB_SUCCESS;
@@ -3114,6 +3222,9 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
         } else { // Be compatible with grammar before
           if (OB_FAIL(resolve_into_outfile_without_format(node, *into_item))) {
           }
+        }
+      } else if (T_COPY_INTO == node->type_) { // copy (query) to 'file' (options)
+        if (OB_FAIL(resolve_copy_into(*node, *into_item))) {
         }
       } else if (T_INTO_DUMPFILE  == node->type_) { // into dumpfile
         if (is_in_set_query()) {

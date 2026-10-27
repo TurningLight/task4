@@ -259,6 +259,7 @@ END_P SET_VAR DELIMITER
 //-----------------------------reserved keyword end-------------------------------------------------
 %token <non_reserved_keyword>
 //-----------------------------non_reserved keyword begin-------------------------------------------
+        HEADER NULLSTR
         ACCESS ACCOUNT ACTION ACTIVE ADDDATE AFTER AGAINST AGGREGATE AI ALGORITHM ALWAYS ALLOW ANALYSE ANY
         APPROX_COUNT_DISTINCT APPROX_COUNT_DISTINCT_SYNOPSIS APPROX_COUNT_DISTINCT_SYNOPSIS_MERGE
         ARRAY ASCII ASIS AT ATTRIBUTE AUTHORS AUTO AUTOEXTEND_SIZE AUTO_INCREMENT AUTO_INCREMENT_CACHE_SIZE
@@ -399,6 +400,7 @@ END_P SET_VAR DELIMITER
 %type <node> replace_with_opt_hint insert_with_opt_hint column_list opt_on_duplicate_key_clause opt_into opt_replace opt_temporary no_param_column_ref
 %type <node> insert_vals_list insert_vals value_or_values opt_insert_row_alias
 %type <node> select_with_parens select_no_parens select_clause select_into no_table_select_with_order_and_limit simple_select_with_order_and_limit select_with_parens_with_order_and_limit select_clause_set_with_order_and_limit
+%type <node> copy_stmt copy_options_opt copy_option_list copy_option copy_option_value
 %type <node> simple_select no_table_select limit_clause select_expr_list opt_approx
 %type <node> with_select with_clause with_list common_table_expr opt_column_alias_name_list alias_name_list column_alias_name
 %type <node> opt_where opt_hint_value opt_groupby opt_rollup opt_order_by order_by opt_having groupby_clause order_by_opt_null
@@ -558,6 +560,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8902,6 +8905,98 @@ LIMIT limit_expr OFFSET limit_expr
   // setup_token_pos_info($$, @1.first_column - 1, @4.last_column - @1.first_column + 1);
   check_ret(setup_token_pos_info_and_dup_string($$, result, @1.first_column, @4.last_column),
             &@1, result);
+}
+;
+
+/* COPY (query) TO 'file' [(options)] -- MySQL/PostgreSQL style data export.
+ *
+ * The statement is rewritten into the existing SELECT ... INTO OUTFILE form:
+ * the inner query parse tree is returned as the statement node and carries a
+ * T_COPY_INTO node in PARSE_SELECT_INTO_EXTRA.  The resolver converts it into
+ * an ObSelectIntoItem with a CSV ObExternalFileFormat, so no new executor is
+ * needed.  T_COPY_INTO has two children: the outfile path, and a T_LINK_NODE
+ * holding the format option nodes (NULL when no option is given). */
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_options_opt
+{
+  ParseNode *copy_into = NULL;
+  malloc_non_terminal_node(copy_into, result->malloc_pool_, T_COPY_INTO, 2, $6, $7);
+  $$ = $3;
+  if (OB_ISNULL($$)) {
+    yyerror(&@1, result, "COPY expects a query");
+    YYABORT_UNEXPECTED;
+  } else if (T_SELECT != $$->type_) {
+    yyerror(&@1, result, "COPY expects a query");
+    YYERROR;
+  } else if (NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY query can not contain an INTO clause");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = copy_into;
+  }
+}
+;
+
+copy_options_opt:
+/* empty */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  ParseNode *copy_options = NULL;
+  merge_nodes(copy_options, result, T_LINK_NODE, $2);
+  $$ = copy_options;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list opt_comma copy_option
+{
+  (void) ($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| HEADER
+{
+  ParseNode *enable_header = NULL;
+  malloc_terminal_node(enable_header, result->malloc_pool_, T_BOOL);
+  enable_header->value_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, enable_header);
+}
+| HEADER opt_equal_mark BOOL_VALUE
+{
+  (void) ($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, $3);
+}
+| NULLSTR STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, $2);
+}
+| FIELD_DELIMITER copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $2);
+}
+;
+
+copy_option_value:
+NAME_OB
+{
+  $$ = $1;
+}
+| STRING_VALUE
+{
+  $$ = $1;
 }
 ;
 
@@ -17549,7 +17644,9 @@ unreserved_keyword_normal { $$=$1;}
 ;
 
 unreserved_keyword_normal:
-ACCOUNT
+HEADER
+|       NULLSTR
+|       ACCOUNT
 |       ACTION
 |       ACTIVE
 |       ADDDATE

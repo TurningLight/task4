@@ -18,6 +18,9 @@
 
 #include <cmath>
 #include <memory>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "ob_select_into_op.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
@@ -38,7 +41,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, column_names_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -230,6 +233,7 @@ int ObSelectIntoOp::inner_get_next_row()
   }
   if (OB_FAIL(ret) && OB_ITER_END != ret) {
     need_commit_ = false;
+    discard_partial_file_ = (NULL != data_writer_);
   }
   return ret;
 }
@@ -312,6 +316,7 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
   }
   if (OB_FAIL(ret)) {
     need_commit_ = false;
+    discard_partial_file_ = (NULL != data_writer_);
   }
   return ret;
 }
@@ -326,6 +331,22 @@ int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  }
+  // a failed COPY must not leave a half written file behind
+  if (discard_partial_file_ && T_INTO_OUTFILE == MY_SPEC.into_type_ && !basic_url_.empty()) {
+#ifndef _WIN32
+    int tmp_errno = 0;
+    ObSqlString path;
+    if (OB_FAIL(path.append_fmt("%.*s", basic_url_.length(), basic_url_.ptr()))) {
+      LOG_WARN("failed to build the partial outfile path", K(ret));
+    } else if (0 != ::unlink(path.ptr())) {
+      tmp_errno = errno;
+      if (ENOENT != tmp_errno) {
+        LOG_WARN("failed to remove the partial outfile", K(tmp_errno), K(path));
+      }
+    }
+#endif
+    discard_partial_file_ = false;
   }
   return ret;
 }
@@ -1244,6 +1265,20 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
     csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
     if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+    }
+  }
+  // COPY (query) TO 'file' (header): the header line precedes every data row
+  if (OB_SUCC(ret) && !header_written_) {
+    ObCsvFileWriter *header_writer = static_cast<ObCsvFileWriter *>(data_writer);
+    if (OB_UNLIKELY(!MY_SPEC.column_names_.str_.empty())
+        && OB_LIKELY(T_INTO_OUTFILE == MY_SPEC.into_type_)
+        && OB_LIKELY(MY_SPEC.is_single_)
+        && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
+      header_written_ = true;
+      if (OB_FAIL(header_writer->flush_data(MY_SPEC.column_names_.str_.ptr(),
+                                            MY_SPEC.column_names_.str_.length()))) {
+        LOG_WARN("failed to write the csv header", K(ret));
+      }
     }
   }
   return ret;
