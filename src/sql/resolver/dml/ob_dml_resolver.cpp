@@ -3807,14 +3807,21 @@ int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table named argument is not supported");
       } else if (!is_sample_size) {
         // header / format / nullstr / columns：取值由执行层校验
-      } else if (NULL == arg->children_[1] || T_INT != arg->children_[1]->type_) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
       } else {
+        // sample_size 只接受 -1。注意 -1 在文法里不是负数字面量，
+        // 而是 T_OP_NEG 包一个 T_INT(1)，必须单独展开。
         char buf[32];
-        int64_t len = snprintf(buf, sizeof(buf), "%.*s",
-                               arg->children_[1]->str_len_,
-                               arg->children_[1]->str_value_);
+        int64_t len = 0;
+        const ParseNode *v = arg->children_[1];
+        if (NULL != v && T_INT == v->type_ && NULL != v->str_value_) {
+          len = snprintf(buf, sizeof(buf), "%.*s",
+                         v->str_len_, v->str_value_);
+        } else if (NULL != v && 1 == v->num_child_ && NULL != v->children_[0]
+                   && T_INT == v->children_[0]->type_
+                   && NULL != v->children_[0]->str_value_) {
+          len = snprintf(buf, sizeof(buf), "-%.*s",
+                         v->children_[0]->str_len_, v->children_[0]->str_value_);
+        }
         if (len <= 0 || 0 != strcmp(buf, "-1")) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
