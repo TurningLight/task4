@@ -16,14 +16,14 @@ namespace sql {
 
 namespace {
 
-void ob_set_error(std::string *err, const std::string &message)
+void jl_ob_set_error(std::string *err, const std::string &message)
 {
   if (NULL != err) {
     *err = message;
   }
 }
 
-bool ob_parse_i64(const std::string &text, int64_t *value)
+bool jl_ob_parse_i64(const std::string &text, int64_t *value)
 {
   const size_t n = text.size();
   size_t i = 0;
@@ -63,7 +63,7 @@ bool ob_parse_i64(const std::string &text, int64_t *value)
 }
 
 // Shortest round-trip rendering, plain decimal for everyday magnitudes.
-std::string ob_format_double(double value)
+std::string jl_ob_format_double(double value)
 {
   if (value != value) {
     return "nan";
@@ -532,7 +532,7 @@ class ObJsonParser {
   size_t pos_;
 };
 
-ObJsonlType ob_classify_node(const ObJsonNode &node)
+ObJsonlType jl_ob_classify_node(const ObJsonNode &node)
 {
   switch (node.kind) {
     case OB_JSON_NODE_NULL:
@@ -543,7 +543,7 @@ ObJsonlType ob_classify_node(const ObJsonNode &node)
       return OB_JSONL_TYPE_VARCHAR;  // date-looking strings stay VARCHAR
     case OB_JSON_NODE_NUMBER: {
       int64_t ignored = 0;
-      if (node.integral && ob_parse_i64(node.text, &ignored)) {
+      if (node.integral && jl_ob_parse_i64(node.text, &ignored)) {
         return OB_JSONL_TYPE_BIGINT;
       }
       return OB_JSONL_TYPE_DOUBLE;
@@ -553,7 +553,7 @@ ObJsonlType ob_classify_node(const ObJsonNode &node)
   }
 }
 
-ObJsonlType ob_merge_types(ObJsonlType left, ObJsonlType right)
+ObJsonlType jl_ob_merge_types(ObJsonlType left, ObJsonlType right)
 {
   if (left == right) {
     return left;
@@ -572,7 +572,7 @@ ObJsonlType ob_merge_types(ObJsonlType left, ObJsonlType right)
 }
 
 // Text form of a scalar, used when a column widened to VARCHAR.
-std::string ob_scalar_text(const ObJsonNode &node)
+std::string jl_ob_scalar_text(const ObJsonNode &node)
 {
   switch (node.kind) {
     case OB_JSON_NODE_STRING:
@@ -586,7 +586,7 @@ std::string ob_scalar_text(const ObJsonNode &node)
   }
 }
 
-bool ob_json_node_to_value(const ObJsonNode &node, ObJsonlType type,
+bool jl_ob_json_node_to_value(const ObJsonNode &node, ObJsonlType type,
                            ObJsonlValue *value, std::string *error)
 {
   value->type = type;
@@ -598,7 +598,7 @@ bool ob_json_node_to_value(const ObJsonNode &node, ObJsonlType type,
 
   if (OB_JSONL_TYPE_SQL_NULL == type) {
     if (OB_JSON_NODE_NULL != node.kind) {
-      ob_set_error(error, "non-null JSON value in a column inferred as NULL");
+      jl_ob_set_error(error, "non-null JSON value in a column inferred as NULL");
       return false;
     }
     value->is_null = true;
@@ -611,22 +611,22 @@ bool ob_json_node_to_value(const ObJsonNode &node, ObJsonlType type,
   switch (type) {
     case OB_JSONL_TYPE_BIGINT:
       if (OB_JSON_NODE_NUMBER != node.kind ||
-          !ob_parse_i64(node.text, &value->int_value)) {
-        ob_set_error(error, "cannot convert \"" + ob_scalar_text(node) +
+          !jl_ob_parse_i64(node.text, &value->int_value)) {
+        jl_ob_set_error(error, "cannot convert \"" + jl_ob_scalar_text(node) +
                                 "\" to BIGINT");
         return false;
       }
       return true;
     case OB_JSONL_TYPE_DOUBLE: {
       if (OB_JSON_NODE_NUMBER != node.kind) {
-        ob_set_error(error, "cannot convert \"" + ob_scalar_text(node) +
+        jl_ob_set_error(error, "cannot convert \"" + jl_ob_scalar_text(node) +
                                 "\" to DOUBLE");
         return false;
       }
       char *end = NULL;
       const double parsed = ::strtod(node.text.c_str(), &end);
       if (NULL == end || end != node.text.c_str() + node.text.size()) {
-        ob_set_error(error, "cannot convert \"" + node.text + "\" to DOUBLE");
+        jl_ob_set_error(error, "cannot convert \"" + node.text + "\" to DOUBLE");
         return false;
       }
       value->double_value = parsed;
@@ -634,34 +634,34 @@ bool ob_json_node_to_value(const ObJsonNode &node, ObJsonlType type,
     }
     case OB_JSONL_TYPE_BOOLEAN:
       if (OB_JSON_NODE_BOOL != node.kind) {
-        ob_set_error(error, "cannot convert \"" + ob_scalar_text(node) +
+        jl_ob_set_error(error, "cannot convert \"" + jl_ob_scalar_text(node) +
                                 "\" to BOOLEAN");
         return false;
       }
       value->bool_value = node.bool_value;
       return true;
     case OB_JSONL_TYPE_VARCHAR:
-      value->string_value = ob_scalar_text(node);
+      value->string_value = jl_ob_scalar_text(node);
       return true;
     default:
-      ob_set_error(error, "unexpected inferred column type");
+      jl_ob_set_error(error, "unexpected inferred column type");
       return false;
   }
 }
 
-bool ob_check_flat_object(const ObJsonDocument &doc, uint64_t line_no,
+bool jl_ob_check_flat_object(const ObJsonDocument &doc, uint64_t line_no,
                           std::string *error)
 {
   const ObJsonNode &root = doc.nodes[doc.root];
   if (OB_JSON_NODE_OBJECT != root.kind) {
-    ob_set_error(error, "line " + std::to_string(line_no) +
+    jl_ob_set_error(error, "line " + std::to_string(line_no) +
                             ": the top-level JSON value must be an object");
     return false;
   }
   for (size_t i = 0; i < root.children.size(); ++i) {
     const ObJsonNodeKind kind = doc.nodes[root.children[i]].kind;
     if (OB_JSON_NODE_OBJECT == kind || OB_JSON_NODE_ARRAY == kind) {
-      ob_set_error(error, "line " + std::to_string(line_no) + ": field \"" +
+      jl_ob_set_error(error, "line " + std::to_string(line_no) + ": field \"" +
                               root.keys[i] +
                               "\" is a nested object/array; only flat objects "
                               "are supported");
@@ -673,7 +673,7 @@ bool ob_check_flat_object(const ObJsonDocument &doc, uint64_t line_no,
 
 // Reads the next non-blank line. Returns false only on an I/O error; at EOF it
 // returns true with *have == false.
-bool ob_read_record_line(std::ifstream *in, std::string *line, uint64_t *line_no,
+bool jl_ob_read_record_line(std::ifstream *in, std::string *line, uint64_t *line_no,
                          bool *have)
 {
   *have = false;
@@ -735,7 +735,7 @@ std::string ob_jsonl_value_to_string(const ObJsonlValue &value)
     case OB_JSONL_TYPE_BIGINT:
       return std::to_string(value.int_value);
     case OB_JSONL_TYPE_DOUBLE:
-      return ob_format_double(value.double_value);
+      return jl_ob_format_double(value.double_value);
     case OB_JSONL_TYPE_BOOLEAN:
       return value.bool_value ? "true" : "false";
     case OB_JSONL_TYPE_VARCHAR:
@@ -784,7 +784,7 @@ bool ObJsonlScanner::open(const std::string &path, std::string *err)
   error->clear();
   std::ifstream probe(path.c_str(), std::ios::in | std::ios::binary);
   if (!probe.is_open()) {
-    ob_set_error(error, "cannot open file for reading: " + path);
+    jl_ob_set_error(error, "cannot open file for reading: " + path);
     return false;
   }
   probe.close();
@@ -806,18 +806,18 @@ bool ObJsonlScanner::infer_schema(std::string *err)
   error->clear();
   Impl *impl = impl_.get();
   if (!impl->opened) {
-    ob_set_error(error, "open() must be called before infer_schema()");
+    jl_ob_set_error(error, "open() must be called before infer_schema()");
     return false;
   }
   if (0 == impl->sample_size) {
-    ob_set_error(error,
+    jl_ob_set_error(error,
                  "sample_size = 0 is not supported; use -1 (all records) or N > 0");
     return false;
   }
 
   std::ifstream in(impl->path.c_str(), std::ios::in | std::ios::binary);
   if (!in.is_open()) {
-    ob_set_error(error, "cannot open file for reading: " + impl->path);
+    jl_ob_set_error(error, "cannot open file for reading: " + impl->path);
     return false;
   }
 
@@ -831,8 +831,8 @@ bool ObJsonlScanner::infer_schema(std::string *err)
       break;
     }
     bool have = false;
-    if (!ob_read_record_line(&in, &line, &line_no, &have)) {
-      ob_set_error(error, "I/O error while reading " + impl->path);
+    if (!jl_ob_read_record_line(&in, &line, &line_no, &have)) {
+      jl_ob_set_error(error, "I/O error while reading " + impl->path);
       return false;
     }
     if (!have) {
@@ -842,10 +842,10 @@ bool ObJsonlScanner::infer_schema(std::string *err)
     ObJsonParser parser(line, &doc);
     std::string parse_error;
     if (!parser.parse_document(&parse_error)) {
-      ob_set_error(error, "line " + std::to_string(line_no) + ": " + parse_error);
+      jl_ob_set_error(error, "line " + std::to_string(line_no) + ": " + parse_error);
       return false;
     }
-    if (!ob_check_flat_object(doc, line_no, error)) {
+    if (!jl_ob_check_flat_object(doc, line_no, error)) {
       return false;
     }
     const ObJsonNode &root = doc.nodes[doc.root];
@@ -885,8 +885,8 @@ bool ObJsonlScanner::infer_schema(std::string *err)
       } else {
         column_index = found->second;
       }
-      const ObJsonlType cell = ob_classify_node(node);
-      columns[column_index].type = ob_merge_types(columns[column_index].type, cell);
+      const ObJsonlType cell = jl_ob_classify_node(node);
+      columns[column_index].type = jl_ob_merge_types(columns[column_index].type, cell);
       if (OB_JSONL_TYPE_SQL_NULL == cell) {
         columns[column_index].nullable = true;
       }
@@ -916,7 +916,7 @@ bool ObJsonlScanner::infer_schema(std::string *err)
   impl->reader.open(impl->path.c_str(), std::ios::in | std::ios::binary);
   if (!impl->reader.is_open()) {
     impl->schema_ready = false;
-    ob_set_error(error, "cannot reopen file for reading: " + impl->path);
+    jl_ob_set_error(error, "cannot reopen file for reading: " + impl->path);
     return false;
   }
   return true;
@@ -934,11 +934,11 @@ bool ObJsonlScanner::next_row(std::vector<ObJsonlValue> *row, std::string *err)
   error->clear();
   Impl *impl = impl_.get();
   if (!impl->schema_ready) {
-    ob_set_error(error, "infer_schema() must be called before next_row()");
+    jl_ob_set_error(error, "infer_schema() must be called before next_row()");
     return false;
   }
   if (NULL == row) {
-    ob_set_error(error, "null row output");
+    jl_ob_set_error(error, "null row output");
     return false;
   }
   if (impl->eof) {
@@ -947,8 +947,8 @@ bool ObJsonlScanner::next_row(std::vector<ObJsonlValue> *row, std::string *err)
   std::string line;
   bool have = false;
   for (;;) {
-    if (!ob_read_record_line(&impl->reader, &line, &impl->line_no, &have)) {
-      ob_set_error(error, "I/O error while reading " + impl->path);
+    if (!jl_ob_read_record_line(&impl->reader, &line, &impl->line_no, &have)) {
+      jl_ob_set_error(error, "I/O error while reading " + impl->path);
       return false;
     }
     if (!have) {
@@ -962,10 +962,10 @@ bool ObJsonlScanner::next_row(std::vector<ObJsonlValue> *row, std::string *err)
   ObJsonParser parser(line, &doc);
   std::string parse_error;
   if (!parser.parse_document(&parse_error)) {
-    ob_set_error(error, "line " + std::to_string(record_line) + ": " + parse_error);
+    jl_ob_set_error(error, "line " + std::to_string(record_line) + ": " + parse_error);
     return false;
   }
-  if (!ob_check_flat_object(doc, record_line, error)) {
+  if (!jl_ob_check_flat_object(doc, record_line, error)) {
     return false;
   }
   const ObJsonNode &root = doc.nodes[doc.root];
@@ -980,17 +980,17 @@ bool ObJsonlScanner::next_row(std::vector<ObJsonlValue> *row, std::string *err)
     const std::string &name = root.keys[i];
     const std::map<std::string, size_t>::const_iterator found = impl->index.find(name);
     if (impl->index.end() == found) {
-      ob_set_error(error, "line " + std::to_string(record_line) + ": field \"" +
+      jl_ob_set_error(error, "line " + std::to_string(record_line) + ": field \"" +
                               name +
                               "\" is not in the inferred schema (a bounded "
                               "sample_size may be unrepresentative)");
       return false;
     }
     std::string conversion_error;
-    if (!ob_json_node_to_value(doc.nodes[root.children[i]],
+    if (!jl_ob_json_node_to_value(doc.nodes[root.children[i]],
                                impl->columns[found->second].type,
                                &(*row)[found->second], &conversion_error)) {
-      ob_set_error(error, "line " + std::to_string(record_line) + ", field \"" +
+      jl_ob_set_error(error, "line " + std::to_string(record_line) + ", field \"" +
                               name + "\": " + conversion_error);
       return false;
     }
