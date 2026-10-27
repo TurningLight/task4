@@ -3998,6 +3998,7 @@ static int fs_infer_schema(const ObString &func_name,
   return ret;
 }
 
+
 int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
                                            TableItem *&tbl_item)
 {
@@ -4063,17 +4064,67 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       ObSEArray<common::ObDataType, 8> types;
       if (OB_FAIL(fs_infer_schema(func_name, path, has_header, sample_size,
                                   *allocator_, names, types))) {
-      } else {
-        char buf[512];
-        int off = snprintf(buf, sizeof(buf), "FILEDBG func=%.*s cols=%lld",
-                           func_name.length(), func_name.ptr(), (long long)names.count());
-        for (int64_t i = 0; i < names.count() && off > 0 && off < (int)sizeof(buf); ++i) {
-          off += snprintf(buf + off, sizeof(buf) - off, " %.*s:%d",
-                          names.at(i).length(), names.at(i).ptr(),
-                          (int)types.at(i).get_obj_type());
-        }
+      } else if (0 == names.count()) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_USER_ERROR(OB_ERR_UNEXPECTED, buf);
+        LOG_WARN("file table has no column", K(path));
+      } else {
+        TableItem *item = NULL;
+        ObJsonTableDef *table_def = NULL;
+        ObString tbl_name;
+        ObRawExpr *path_expr = NULL;
+        void *def_buf = NULL;
+        if (OB_ISNULL(def_buf = allocator_->alloc(sizeof(ObJsonTableDef)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (FALSE_IT(table_def = new (def_buf) ObJsonTableDef())) {
+        } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (NULL != parse_tree.children_[2]
+                   && NULL != parse_tree.children_[2]->str_value_) {
+          tbl_name.assign_ptr(parse_tree.children_[2]->str_value_,
+                              static_cast<int32_t>(parse_tree.children_[2]->str_len_));
+        } else if (OB_FAIL(stmt->generate_json_table_name(*allocator_, tbl_name))) {
+        }
+        // 文件路径作为常量表达式放进 doc_exprs_，运行时由算子取用
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(resolve_sql_expr(*path_node, path_expr))) {
+          } else if (OB_ISNULL(path_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(table_def->doc_exprs_.push_back(path_expr))) {
+          } else {
+            table_def->table_type_ = MulModeTableType::OB_FILE_TABLE_TYPE;
+          }
+        }
+        if (OB_SUCC(ret)) {
+          item->table_id_ = generate_table_id();
+          item->table_name_ = tbl_name;
+          item->alias_name_ = tbl_name;
+          item->type_ = TableItem::FILE_TABLE;
+          item->is_view_table_ = false;
+          item->json_table_def_ = table_def;
+          if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+          }
+          for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+            ObJtColBaseInfo *col_info = NULL;
+            ColumnItem *col_item = NULL;
+            void *cbuf = NULL;
+            if (OB_ISNULL(cbuf = allocator_->alloc(sizeof(ObJtColBaseInfo)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else if (FALSE_IT(col_info = new (cbuf) ObJtColBaseInfo())) {
+            } else if (FALSE_IT(col_info->col_name_ = names.at(i))) {
+            } else if (FALSE_IT(col_info->data_type_ = types.at(i))) {
+            } else if (FALSE_IT(col_info->id_ = static_cast<int32_t>(OB_APP_MIN_COLUMN_ID + i))) {
+            } else if (FALSE_IT(col_info->output_column_idx_ = OB_APP_MIN_COLUMN_ID + i)) {
+            } else if (OB_FAIL(generate_json_table_output_column_item(
+                                 item, types.at(i), names.at(i),
+                                 OB_APP_MIN_COLUMN_ID + i, col_item))) {
+            } else if (FALSE_IT(col_item->col_idx_ = table_def->all_cols_.count())) {
+            } else if (OB_FAIL(table_def->all_cols_.push_back(col_info))) {
+            }
+          }
+          if (OB_SUCC(ret)) {
+            tbl_item = item;
+          }
+        }
       }
     }
   }
