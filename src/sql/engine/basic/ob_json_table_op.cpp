@@ -372,8 +372,11 @@ static bool fs_schema_matches(const ObJsonTableSpec &spec,
   }
   for (int64_t i = 0; matched && i < scanned_count; ++i) {
     ObObjType scanned_type = ObMaxType;
+    const std::string *scanned_name = NULL;
     if (ObFileTableScanState::FMT_CSV == state->fmt_) {
-      switch (state->csv_.schema().at(static_cast<size_t>(i)).type) {
+      const ObCsvColumnSchema &col = state->csv_.schema().at(static_cast<size_t>(i));
+      scanned_name = &col.name;
+      switch (col.type) {
         case OB_CSV_TYPE_BIGINT:   scanned_type = ObIntType;      break;
         case OB_CSV_TYPE_DOUBLE:   scanned_type = ObDoubleType;   break;
         case OB_CSV_TYPE_BOOLEAN:  scanned_type = ObTinyIntType;  break;
@@ -382,14 +385,18 @@ static bool fs_schema_matches(const ObJsonTableSpec &spec,
         default:                   scanned_type = ObVarcharType;  break;
       }
     } else if (ObFileTableScanState::FMT_JSONL == state->fmt_) {
-      switch (state->jsonl_.schema().at(static_cast<size_t>(i)).type) {
+      const ObJsonlColumnSchema &col = state->jsonl_.schema().at(static_cast<size_t>(i));
+      scanned_name = &col.name;
+      switch (col.type) {
         case OB_JSONL_TYPE_BIGINT:  scanned_type = ObIntType;     break;
         case OB_JSONL_TYPE_DOUBLE:  scanned_type = ObDoubleType;  break;
         case OB_JSONL_TYPE_BOOLEAN: scanned_type = ObTinyIntType; break;
         default:                    scanned_type = ObVarcharType; break;
       }
     } else {
-      switch (state->parquet_.columns().at(static_cast<size_t>(i)).physical_type) {
+      const obparquet::ColumnInfo &col = state->parquet_.columns().at(static_cast<size_t>(i));
+      scanned_name = &col.name;
+      switch (col.physical_type) {
         case obparquet::PT_INT32:
         case obparquet::PT_INT64:  scanned_type = ObIntType;    break;
         case obparquet::PT_FLOAT:
@@ -399,6 +406,15 @@ static bool fs_schema_matches(const ObJsonTableSpec &spec,
     }
     if (scanned_type != spec.cols_def_.at(i)->data_type_.get_obj_type()) {
       matched = false;
+    } else if (NULL != scanned_name) {
+      // names too: a different header mode (header = false) keeps the column count but
+      // renames the columns and would silently drop the first data row.
+      const ObString plan_name = spec.cols_def_.at(i)->col_name_;
+      const ObString scanner_name(static_cast<int32_t>(scanned_name->size()),
+                                  scanned_name->c_str());
+      if (0 != plan_name.case_compare(scanner_name)) {
+        matched = false;
+      }
     }
   }
   return matched;
