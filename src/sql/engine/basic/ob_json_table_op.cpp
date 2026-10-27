@@ -342,6 +342,68 @@ static ObExpr *fs_target_expr(const ObJsonTableSpec &spec, int64_t col_idx)
   return expr;
 }
 
+// glob() produces one VARCHAR column named `file`; that shape is the only signal that
+// the plan was built by glob() when the pattern has no wildcard (see open_file_scan).
+static bool fs_plan_is_glob_column(const ObJsonTableSpec &spec)
+{
+  return 1 == spec.cols_def_.count()
+      && ObVarcharType == spec.cols_def_.at(0)->data_type_.get_obj_type()
+      && 0 == spec.cols_def_.at(0)->col_name_.case_compare("file");
+}
+
+// The resolver inferred the plan schema by scanning this same file, so the scanner must
+// reproduce it column by column. A mismatch means this is not the mode the plan was
+// built for (glob() on a plain path) or that the file changed under us; both are better
+// reported than rendered as garbage.
+static bool fs_schema_matches(const ObJsonTableSpec &spec,
+                              const ObFileTableScanState *state)
+{
+  bool matched = true;
+  int64_t scanned_count = 0;
+  if (ObFileTableScanState::FMT_CSV == state->fmt_) {
+    scanned_count = static_cast<int64_t>(state->csv_.schema().size());
+  } else if (ObFileTableScanState::FMT_JSONL == state->fmt_) {
+    scanned_count = static_cast<int64_t>(state->jsonl_.schema().size());
+  } else {
+    scanned_count = static_cast<int64_t>(state->parquet_.columns().size());
+  }
+  if (scanned_count != spec.cols_def_.count()) {
+    matched = false;
+  }
+  for (int64_t i = 0; matched && i < scanned_count; ++i) {
+    ObObjType scanned_type = ObMaxType;
+    if (ObFileTableScanState::FMT_CSV == state->fmt_) {
+      switch (state->csv_.schema().at(static_cast<size_t>(i)).type) {
+        case OB_CSV_TYPE_BIGINT:   scanned_type = ObIntType;      break;
+        case OB_CSV_TYPE_DOUBLE:   scanned_type = ObDoubleType;   break;
+        case OB_CSV_TYPE_BOOLEAN:  scanned_type = ObTinyIntType;  break;
+        case OB_CSV_TYPE_DATE:     scanned_type = ObDateType;     break;
+        case OB_CSV_TYPE_DATETIME: scanned_type = ObDateTimeType; break;
+        default:                   scanned_type = ObVarcharType;  break;
+      }
+    } else if (ObFileTableScanState::FMT_JSONL == state->fmt_) {
+      switch (state->jsonl_.schema().at(static_cast<size_t>(i)).type) {
+        case OB_JSONL_TYPE_BIGINT:  scanned_type = ObIntType;     break;
+        case OB_JSONL_TYPE_DOUBLE:  scanned_type = ObDoubleType;  break;
+        case OB_JSONL_TYPE_BOOLEAN: scanned_type = ObTinyIntType; break;
+        default:                    scanned_type = ObVarcharType; break;
+      }
+    } else {
+      switch (state->parquet_.columns().at(static_cast<size_t>(i)).physical_type) {
+        case obparquet::PT_INT32:
+        case obparquet::PT_INT64:  scanned_type = ObIntType;    break;
+        case obparquet::PT_FLOAT:
+        case obparquet::PT_DOUBLE: scanned_type = ObDoubleType; break;
+        default:                   scanned_type = ObVarcharType; break;
+      }
+    }
+    if (scanned_type != spec.cols_def_.at(i)->data_type_.get_obj_type()) {
+      matched = false;
+    }
+  }
+  return matched;
+}
+
 // NOTE: the varchar payload points into the scanner's row buffer, which stays valid
 // until the next next_row() call. That is enough here because this operator is not
 // vectorized (ObOpSpec::is_vectorized() == false for PHY_JSON_TABLE), so the framework
@@ -1954,6 +2016,27 @@ int ObJsonTableOp::open_file_scan()
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("cannot detect file table format", "path", file_state_->path_.c_str());
+  }
+  if (OB_SUCC(ret) && ObFileTableScanState::FMT_GLOB != file_state_->fmt_
+      && !fs_schema_matches(spec, file_state_)) {
+    // The plan schema was inferred from this file, so it must match. When it does not,
+    // the plan was most likely built by glob() on a path that has no wildcard: only the
+    // path travels into the plan, so such a call is indistinguishable from
+    // read_<format>() on the same path. glob's single varchar `file` column identifies
+    // it; fall back to glob semantics instead of returning mismatched values.
+    if (fs_plan_is_glob_column(spec)) {
+      file_state_->csv_.close();
+      file_state_->jsonl_.close();
+      file_state_->parquet_.Close();
+      file_state_->parquet_cols_.clear();
+      file_state_->fmt_ = ObFileTableScanState::FMT_GLOB;
+      ret = fs_glob_collect(file_state_->path_, &file_state_->files_);
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("file schema does not match the inferred plan schema, file changed "
+               "between resolve and execute?",
+               "path", file_state_->path_.c_str());
+    }
   }
   LOG_TRACE("open file scan", K(ret), "path", file_state_->path_.c_str());
   return ret;
