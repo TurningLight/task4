@@ -176,6 +176,7 @@ public:
   explicit ObDMLResolver(ObResolverParams &params);
   virtual ~ObDMLResolver();
   friend class ObDefaultValueUtils;
+  friend class ObExplainResolver;
   inline void set_current_level(int32_t level) { current_level_ = level; }
   inline int32_t get_current_level() const { return current_level_; }
   inline void set_current_view_level(int32_t level) { current_view_level_ = level; }

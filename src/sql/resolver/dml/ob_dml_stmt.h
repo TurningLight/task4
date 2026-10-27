@@ -80,12 +80,19 @@ typedef struct ObJtColBaseInfo
       int32_t reserved_ : 31;
     };
   };
+  // File table only (read_csv/read_json/read_parquet/glob): the DuckDB spelling of
+  // the inferred column type ("BOOLEAN", "BIGINT", ...) plus the nullability inferred
+  // by the file scanner. Both remain empty/false for every other json table, which
+  // is also how the DESCRIBE path tells a file table column apart.
+  ObString fs_type_name_;
+  bool fs_nullable_;
 
   int deep_copy(const ObJtColBaseInfo& src, ObIAllocator* allocator);
   int assign(const ObJtColBaseInfo& src);
 
   TO_STRING_KV(K_(col_type), K_(format_json), K_(wrapper), K_(allow_scalar),
-   K_(output_column_idx), K_(col_name), K_(path), K_(parent_id), K_(id));
+   K_(output_column_idx), K_(col_name), K_(path), K_(parent_id), K_(id),
+   K_(fs_type_name), K_(fs_nullable));
 } ObJtColBaseInfo;
 
 typedef struct ObJsonTableDef {
