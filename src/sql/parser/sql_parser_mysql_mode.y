@@ -497,6 +497,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%token <non_reserved_keyword> READ_CSV READ_JSON READ_PARQUET GLOB
+%type <node> file_table_expr file_func_name
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -10831,6 +10833,10 @@ tbl_name
   unname_node->sql_str_off_ = @2.first_column;
   $$->value_ = 1; //lateral
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | json_table_expr
 {
   $$ = $1;
@@ -17479,6 +17485,40 @@ literal
 }
 ;
 
+file_func_name:
+READ_CSV
+{
+  make_name_node($$, result->malloc_pool_, "read_csv");
+}
+| READ_JSON
+{
+  make_name_node($$, result->malloc_pool_, "read_json");
+}
+| READ_PARQUET
+{
+  make_name_node($$, result->malloc_pool_, "read_parquet");
+}
+| GLOB
+{
+  make_name_node($$, result->malloc_pool_, "glob");
+}
+;
+
+file_table_expr:
+file_func_name '(' simple_expr_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| file_func_name '(' simple_expr_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| file_func_name '(' simple_expr_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}
@@ -18181,6 +18221,10 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       READ_CSV
+|       READ_JSON
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:

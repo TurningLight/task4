@@ -2701,6 +2701,11 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         OZ (resolve_function_table_item(*table_node, table_item));
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
+        }
+        break;
+      }
       case T_JSON_TABLE_EXPRESSION: {
         OZ (resolve_json_table_item(*table_node, table_item));
         break;
@@ -3762,6 +3767,93 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
 
   if (OB_SUCC(ret) && OB_NOT_NULL(params_.query_ctx_)) {
     params_.query_ctx_->has_hybrid_search_ = true;
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
+                                         const ParseNode &args_node)
+{
+  int ret = OB_SUCCESS;
+  ObString func_name;
+  func_name.assign_ptr(name_node.str_value_, static_cast<int32_t>(name_node.str_len_));
+  const bool is_glob = (0 == func_name.case_compare("glob"));
+  int64_t positional = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < args_node.num_child_; ++i) {
+    const ParseNode *arg = args_node.children_[i];
+    if (OB_ISNULL(arg)) {
+      ret = OB_ERR_PARSER_SYNTAX;
+    } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_
+               && NULL != arg->children_[0] && T_IDENT == arg->children_[0]->type_) {
+      // 命名参数：sample_size 只支持 -1；其余已知参数交给执行层校验
+      ObString key;
+      key.assign_ptr(arg->children_[0]->str_value_,
+                     static_cast<int32_t>(arg->children_[0]->str_len_));
+      const bool is_sample_size = (0 == key.case_compare("sample_size"));
+      const bool known = is_sample_size
+                         || 0 == key.case_compare("header")
+                         || 0 == key.case_compare("format")
+                         || 0 == key.case_compare("nullstr")
+                         || 0 == key.case_compare("columns");
+      if (!known) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table named argument is not supported");
+      } else if (!is_sample_size) {
+        // header / format / nullstr / columns：取值由执行层校验
+      } else if (NULL == arg->children_[1] || T_INT != arg->children_[1]->type_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
+      } else {
+        char buf[32];
+        int64_t len = snprintf(buf, sizeof(buf), "%.*s",
+                               arg->children_[1]->str_len_,
+                               arg->children_[1]->str_value_);
+        if (len <= 0 || 0 != strcmp(buf, "-1")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
+        }
+      }
+    } else if (T_VARCHAR == arg->type_ || T_CHAR == arg->type_) {
+      ++positional;
+      if (positional >= 2 && !is_glob) {
+        ObString fmt;
+        fmt.assign_ptr(arg->str_value_, static_cast<int32_t>(arg->str_len_));
+        if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("auto")
+            && 0 != fmt.case_compare("json") && 0 != fmt.case_compare("newline_delimited")) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        }
+      }
+    } else {
+      ++positional;
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
+                                           TableItem *&tbl_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObDMLStmt *stmt = get_stmt();
+  tbl_item = NULL;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(T_FILE_TABLE_EXPRESSION != parse_tree.type_
+                         || 3 != parse_tree.num_child_
+                         || OB_ISNULL(parse_tree.children_[0])
+                         || OB_ISNULL(parse_tree.children_[1]))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "file sql is disabled, set session enable_file_sql = ON first");
+  } else if (OB_FAIL(check_file_table_args(*parse_tree.children_[0],
+                                           *parse_tree.children_[1]))) {
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table scan");
   }
   return ret;
 }
