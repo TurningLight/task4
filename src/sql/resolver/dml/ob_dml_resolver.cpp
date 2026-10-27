@@ -3843,6 +3843,20 @@ int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
 
 
 // FILE_SQL_SCHEMA_INFER: 把文件内容推断成列元数据（resolve 阶段执行）
+//
+// A string column must carry a real collation: ObObjMeta::set_type() leaves
+// cs_type_/cs_level_ at CS_TYPE_INVALID/CS_LEVEL_INVALID for string types, and
+// everything downstream (optimizer, code generator, expr frames) rejects a
+// string type whose collation is invalid.
+static inline void fs_set_varchar_meta(common::ObDataType &dt)
+{
+  dt.set_obj_type(ObVarcharType);
+  dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+  dt.set_charset_type(ObCharset::get_default_charset());
+  dt.set_collation_level(CS_LEVEL_IMPLICIT);
+  dt.set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
+}
+
 static int fs_map_csv_type(const ObCsvType t, common::ObDataType &dt)
 {
   int ret = OB_SUCCESS;
@@ -3853,7 +3867,10 @@ static int fs_map_csv_type(const ObCsvType t, common::ObDataType &dt)
       break;
     case OB_CSV_TYPE_DOUBLE:
       dt.set_obj_type(ObDoubleType);
-      dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObDoubleType]);
+      // NOT_FIXED_SCALE, like a plain `double` column: MAX_ACCURACY would render
+      // every value with 30 fractional digits ("98.500000..."), which is not what
+      // a MySQL client shows for a double column.
+      dt.set_accuracy(ObAccuracy());
       break;
     case OB_CSV_TYPE_BOOLEAN:
       dt.set_obj_type(ObTinyIntType);
@@ -3865,13 +3882,14 @@ static int fs_map_csv_type(const ObCsvType t, common::ObDataType &dt)
       break;
     case OB_CSV_TYPE_DATETIME:
       dt.set_obj_type(ObDateTimeType);
-      dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObDateTimeType]);
+      // DATETIME(0), like a plain `datetime` column; MAX_ACCURACY is fsp=6 and
+      // would append a spurious ".000000".
+      dt.set_accuracy(ObAccuracy(19, 0));
       break;
     case OB_CSV_TYPE_VARCHAR:
     case OB_CSV_TYPE_SQL_NULL:
     default:
-      dt.set_obj_type(ObVarcharType);
-      dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+      fs_set_varchar_meta(dt);
       break;
   }
   return ret;
@@ -3896,8 +3914,7 @@ static int fs_infer_schema(const ObString &func_name,
     OZ (ob_write_string(allocator, ObString::make_string("file"), n));
     OZ (col_names.push_back(n));
     common::ObDataType dt;
-    dt.set_obj_type(ObVarcharType);
-    dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+    fs_set_varchar_meta(dt);
     OZ (col_types.push_back(dt));
   } else if (is_parquet) {
     obparquet::Reader reader;
@@ -3921,11 +3938,10 @@ static int fs_infer_schema(const ObString &func_name,
           case obparquet::PT_DOUBLE:
           case obparquet::PT_FLOAT:
             dt.set_obj_type(ObDoubleType);
-            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObDoubleType]);
+            dt.set_accuracy(ObAccuracy());  // NOT_FIXED_SCALE, see fs_map_csv_type
             break;
           default:
-            dt.set_obj_type(ObVarcharType);
-            dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+            fs_set_varchar_meta(dt);
             break;
         }
         OZ (col_types.push_back(dt));
@@ -3956,15 +3972,14 @@ static int fs_infer_schema(const ObString &func_name,
             break;
           case OB_JSONL_TYPE_DOUBLE:
             dt.set_obj_type(ObDoubleType);
-            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObDoubleType]);
+            dt.set_accuracy(ObAccuracy());  // NOT_FIXED_SCALE, see fs_map_csv_type
             break;
           case OB_JSONL_TYPE_BOOLEAN:
             dt.set_obj_type(ObTinyIntType);
             dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObTinyIntType]);
             break;
           default:
-            dt.set_obj_type(ObVarcharType);
-            dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+            fs_set_varchar_meta(dt);
             break;
         }
         OZ (col_types.push_back(dt));
