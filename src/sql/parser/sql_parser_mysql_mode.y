@@ -498,7 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %token <non_reserved_keyword> READ_CSV READ_JSON READ_PARQUET GLOB
-%type <node> file_table_expr file_func_name
+%type <node> file_table_expr file_func_name file_func_arg_list file_func_arg
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -17504,16 +17504,34 @@ READ_CSV
 }
 ;
 
+file_func_arg_list:
+file_func_arg
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_func_arg_list ',' file_func_arg
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_func_arg:
+expr
+{
+  $$ = $1;
+}
+;
+
 file_table_expr:
-file_func_name '(' simple_expr_list ')'
+file_func_name '(' file_func_arg_list ')'
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
 }
-| file_func_name '(' simple_expr_list ')' relation_name
+| file_func_name '(' file_func_arg_list ')' relation_name
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
 }
-| file_func_name '(' simple_expr_list ')' AS relation_name
+| file_func_name '(' file_func_arg_list ')' AS relation_name
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
 }

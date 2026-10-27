@@ -3784,11 +3784,15 @@ int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
     if (OB_ISNULL(arg)) {
       ret = OB_ERR_PARSER_SYNTAX;
     } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_
-               && NULL != arg->children_[0] && T_IDENT == arg->children_[0]->type_) {
+               && NULL != arg->children_[0]) {
       // 命名参数：sample_size 只支持 -1；其余已知参数交给执行层校验
       ObString key;
-      key.assign_ptr(arg->children_[0]->str_value_,
-                     static_cast<int32_t>(arg->children_[0]->str_len_));
+      if (NULL != arg->children_[0]->str_value_ && arg->children_[0]->str_len_ > 0) {
+        key.assign_ptr(arg->children_[0]->str_value_,
+                       static_cast<int32_t>(arg->children_[0]->str_len_));
+      } else {
+        key.assign_ptr(arg->str_value_, static_cast<int32_t>(arg->str_len_));
+      }
       const bool is_sample_size = (0 == key.case_compare("sample_size"));
       const bool known = is_sample_size
                          || 0 == key.case_compare("header")
@@ -3813,14 +3817,18 @@ int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
         }
       }
-    } else if (T_VARCHAR == arg->type_ || T_CHAR == arg->type_) {
+    } else if (NULL != arg->str_value_ && arg->str_len_ > 0) {
       ++positional;
       if (positional >= 2 && !is_glob) {
         ObString fmt;
         fmt.assign_ptr(arg->str_value_, static_cast<int32_t>(arg->str_len_));
         if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("auto")
             && 0 != fmt.case_compare("json") && 0 != fmt.case_compare("newline_delimited")) {
-          ret = OB_ERR_PARSER_SYNTAX;
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL,
+                         "You have an error in your SQL syntax; check the manual that "
+                         "corresponds to your OceanBase version for the right syntax to use",
+                         (int)fmt.length(), fmt.ptr(), 1);
         }
       }
     } else {
