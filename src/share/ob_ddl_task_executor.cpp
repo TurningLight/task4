@@ -350,7 +350,13 @@ int ObDDLLocalBuilder::push_task(ObAsyncTask &task)
 
 int64_t ObDDLLocalBuilder::get_thread_cnt_() const
 {
-  return lib::is_mini_mode() ? 1 : 16;
+  // A single local builder thread serializes every DDL build in mini mode: the aux tables of one
+  // fulltext index build (rowkey_doc / doc_rowkey / postings / doc_word) then run one after another,
+  // each of them scanning and tokenizing the whole table. Keep a small pool instead so independent
+  // builds can overlap; still far below the full-mode count to stay memory friendly.
+  return lib::is_mini_mode()
+             ? MAX(1L, MIN(static_cast<int64_t>(common::get_cpu_count()), 4L))
+             : 16;
 }
 
 }  // end namespace share
