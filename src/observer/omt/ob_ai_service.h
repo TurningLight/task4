@@ -1,4 +1,4 @@
-/*
+/**
  * Copyright (c) 2025 OceanBase.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 #include "share/ob_server_struct.h"
 #include "lib/worker.h"
+#include "lib/thread/threads.h"
 
 namespace oceanbase
 {
@@ -43,6 +44,24 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObAiServiceGuard);
 };
 
+// Background worker of the AI COLUMN feature.
+//
+// It drains oceanbase.__all_ai_column_task: every queued AI expression is
+// evaluated through the normal AI function implementation (which owns the model
+// request) and the results of one request group are published back into the user
+// table in a single transaction together with the task rows, so a row never
+// shows a partially computed set of AI columns.
+class ObAiColumnWorker : public lib::Threads
+{
+public:
+  ObAiColumnWorker();
+  virtual ~ObAiColumnWorker() {}
+  virtual void run1() override;
+private:
+  void poll_once();
+  DISALLOW_COPY_AND_ASSIGN(ObAiColumnWorker);
+};
+
 class ObAiService
 {
 public:
@@ -50,14 +69,15 @@ public:
   virtual ~ObAiService();
   static int server_module_init(ObAiService* &ai_service);
   int init();
-  int start() { return OB_SUCCESS; }
-  void stop() {};
-  void wait() {};
+  int start();
+  void stop();
+  void wait();
   void destroy();
 public:
   int get_ai_service_guard(ObAiServiceGuard &ai_service_guard);
 private:
   bool is_inited_;
+  ObAiColumnWorker ai_column_worker_;
   DISALLOW_COPY_AND_ASSIGN(ObAiService);
 };
 

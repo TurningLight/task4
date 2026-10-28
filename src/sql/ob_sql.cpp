@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL
+#include "sql/ob_ai_column_worker_env.h"
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
 #include "lib/json/ob_json_print_utils.h"
@@ -234,6 +235,8 @@ struct AiDmlState
 static thread_local int64_t g_ai_column_side_depth = 0;
 
 int ai_set_columns(const common::ObString &set_text, common::ObIArray<common::ObString> &cols);
+int ai_store_stmt(common::ObIAllocator &alloc, common::ObIArray<common::ObString> &stmts,
+                  const common::ObSqlString &sql);
 
 inline bool ai_space(const char c)
 {
@@ -739,7 +742,8 @@ int ai_build_task_insert(common::ObSqlString &sql,
 
 // Build one task row per VALUES tuple; the rowkey predicate is rendered straight
 // from the statement text so the hook never has to read rows that do not exist.
-int ai_build_insert_tasks(common::ObSqlString &sql,
+int ai_build_insert_tasks(common::ObIAllocator &alloc,
+                          common::ObIArray<common::ObString> &stmts,
                           const share::schema::ObTableSchema &table_schema,
                           const AiColumnDesc &desc,
                           const uint64_t table_id,
@@ -793,6 +797,9 @@ int ai_build_insert_tasks(common::ObSqlString &sql,
   for (int64_t t = 0; OB_SUCC(ret) && t < tuples.count(); ++t) {
     common::ObSEArray<common::ObString, 8> values;
     common::ObSqlString predicate;
+    // every VALUES tuple yields its own statement: the inner sql connection
+    // executes exactly one statement per call
+    common::ObSqlString sql;
     if (OB_FAIL(ai_split_top_commas(ai_sub(tuples.at(t), 1, tuples.at(t).length() - 2),
                                     false, values))) {
     } else if (OB_FAIL(predicate.append("concat("))) {
@@ -842,7 +849,8 @@ int ai_build_insert_tasks(common::ObSqlString &sql,
                                                "column_name, ai_expr, max_retries, target_type) select "
                                                "%lu, %ld, %lu, 0, 0, now(6), %.*s, '%.*s', ",
                                                AI_TASK_TABLE_FULL_NAME,
-                                               static_cast<unsigned long>(table_id), request_id,
+                                               static_cast<unsigned long>(table_id),
+                                               request_id + t,
                                                static_cast<unsigned long>(desc.column_id_),
                                                predicate.string().length(),
                                                predicate.string().ptr(),
@@ -857,10 +865,12 @@ int ai_build_insert_tasks(common::ObSqlString &sql,
                                       static_cast<unsigned long>(desc.column_id_),
                                       predicate.string().length(),
                                       predicate.string().ptr()))) {
+    } else if (OB_FAIL(ai_store_stmt(alloc, stmts, sql))) {
     }
   }
   if (OB_SUCC(ret)) {
-    LOG_DEBUG("AICOL insert task sql", K(sql), K(db_name), K(table_name), K(tuples.count()));
+    LOG_DEBUG("AICOL insert task sql", K(db_name), K(table_name), K(tuples.count()),
+              "stmts", stmts.count());
   }
   return ret;
 }
@@ -1140,6 +1150,12 @@ int ai_exec(ObSQLSessionInfo &session, const common::ObString &sql)
 int ai_prepare(ObSQLSessionInfo &session, const common::ObString &stmt, AiDmlState &state)
 {
   int ret = OB_SUCCESS;
+  if (ObAiColumnWorkerEnv::is_active()) {
+    // The AI COLUMN background worker is publishing a result (or draining a
+    // finished task). Its own statements are not user DML and must not queue
+    // more work, otherwise every publish would invalidate itself for ever.
+    return OB_SUCCESS;
+  }
   int64_t kind = 0;
   common::ObString db_name;
   common::ObString table_name;
@@ -1176,7 +1192,24 @@ int ai_prepare(ObSQLSessionInfo &session, const common::ObString &stmt, AiDmlSta
       state.kind_ = static_cast<int>(kind);
       state.had_tx_ = (NULL != session.get_tx_desc());
       state.table_id_ = table_schema->get_table_id();
-      state.request_id_ = ATOMIC_AAF(&g_ai_column_request_id, 1);
+      // The task queue rowkey is (table_id, request_id, column_id), so every
+      // changed row needs its own request_id: a multi-row VALUES statement
+      // reserves one id per tuple and renders tuple t with request_id + t.
+      int64_t request_id_count = 1;
+      if (1 == kind && values_pos > 0) {
+        common::ObSEArray<common::ObString, 8> values_tuples;
+        const common::ObString values_text = ai_sub(
+            stmt, static_cast<int32_t>(values_pos),
+            stmt.length() - static_cast<int32_t>(values_pos));
+        if (OB_FAIL(ai_split_values(values_text, values_tuples))) {
+        } else if (values_tuples.count() > 0) {
+          request_id_count = values_tuples.count();
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        state.request_id_ = ATOMIC_AAF(&g_ai_column_request_id, request_id_count);
+      }
       bool pk_changed = false;
       if (2 == kind) {
         const int64_t set_pos = ai_find_word(stmt, 0, "set");
@@ -1202,11 +1235,10 @@ int ai_prepare(ObSQLSessionInfo &session, const common::ObString &stmt, AiDmlSta
         // queue the rows this insert creates, straight from the VALUES text
         if (values_pos > 0) {
           for (int64_t i = 0; OB_SUCC(ret) && i < state.ai_columns_.count(); ++i) {
-            common::ObSqlString sql;
-            if (OB_FAIL(ai_build_insert_tasks(sql, *table_schema, state.ai_columns_.at(i),
+            if (OB_FAIL(ai_build_insert_tasks(state.alloc_, state.pre_stmts_,
+                                              *table_schema, state.ai_columns_.at(i),
                                               state.table_id_, state.request_id_, stmt,
                                               values_pos, db_name, table_name))) {
-            } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
             }
           }
         }
