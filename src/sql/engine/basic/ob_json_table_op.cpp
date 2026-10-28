@@ -239,6 +239,12 @@ static int fs_glob_collect(const std::string &pattern, std::vector<std::string> 
         if (0 == std::strcmp(ent->d_name, ".") || 0 == std::strcmp(ent->d_name, "..")) {
           continue;
         }
+        // A leading dot marks a hidden entry. Shell and DuckDB wildcards never
+        // match one unless the pattern itself starts with a dot, so `glob('/d/*')`
+        // must not return `._basic.csv` / `.DS_Store` style metadata files.
+        if ('.' == ent->d_name[0] && '.' != file_pat[0]) {
+          continue;
+        }
         if (!fs_glob_match(file_pat.c_str(), ent->d_name)) {
           continue;
         }
