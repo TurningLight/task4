@@ -364,6 +364,12 @@ int ObCreateTableResolver::resolve(const ParseNode &parse_tree)
 
         if (OB_SUCC(ret)) {
           ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
+          if (OB_FAIL(add_ai_hidden_columns())) {
+          }
+        }
+
+        if (OB_SUCC(ret)) {
+          ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
           table_schema.set_define_user_id(session_info_->get_priv_user_id());
           create_table_stmt->set_if_not_exists(if_not_exist_);
           if (false == is_temporary_table && OB_NOT_NULL(create_table_node->children_[7])) {
@@ -2342,5 +2348,100 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
   }
   return ret;
 }
+
+int ObCreateTableResolver::add_ai_hidden_columns()
+{
+  int ret = OB_SUCCESS;
+  ObCreateTableStmt *create_table_stmt = static_cast<ObCreateTableStmt*>(stmt_);
+  ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
+  ObSEArray<uint64_t, 4> ai_col_ids;
+  ObSEArray<ObString, 4> ai_col_names;
+  ObSEArray<ObColumnSchemaV2 *, 4> ai_col_ptrs;
+  for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
+       OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+    if ((*it)->is_ai_column()) {
+      if (OB_FAIL(ai_col_ids.push_back((*it)->get_column_id()))) {
+      } else if (OB_FAIL(ai_col_names.push_back((*it)->get_column_name_str()))) {
+      } else if (OB_FAIL(ai_col_ptrs.push_back(*it))) {
+      }
+    }
+  }
+  // dependency check: an AI column must not reference another AI column
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_col_ids.count(); ++i) {
+    const ObColumnSchemaV2 *col = ai_col_ptrs.at(i);
+    if (OB_ISNULL(col)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const ObString &expr = col->get_ai_normalized_expr();
+      int64_t pos = 0;
+      while (pos < expr.length()) {
+        while (pos < expr.length() && !isalnum(expr[pos]) && '_' != expr[pos]) {
+          ++pos;
+        }
+        int64_t start = pos;
+        while (pos < expr.length() && (isalnum(expr[pos]) || '_' == expr[pos])) {
+          ++pos;
+        }
+        if (pos > start) {
+          ObString token(static_cast<int32_t>(pos - start), expr.ptr() + start);
+          for (int64_t j = 0; j < ai_col_names.count(); ++j) {
+            if (token.case_compare(ai_col_names.at(j)) == 0
+                && ai_col_ids.at(j) != ai_col_ids.at(i)) {
+              ret = OB_NOT_SUPPORTED;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  // generate 3 hidden columns per AI column
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_col_ids.count(); ++i) {
+    ObColumnSchemaV2 *ai_col = ai_col_ptrs.at(i);
+    if (OB_ISNULL(ai_col)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const uint64_t state_id = gen_column_id();
+      const uint64_t request_id = gen_column_id();
+      const uint64_t spec_id = gen_column_id();
+      ObSqlString name_buf;
+      ObColumnSchemaV2 state_col;
+      ObColumnSchemaV2 request_col;
+      ObColumnSchemaV2 spec_col;
+      state_col.reset();
+      request_col.reset();
+      spec_col.reset();
+      ObColumnSchemaV2 *cols[3] = { &state_col, &request_col, &spec_col };
+      const uint64_t ids[3] = { state_id, request_id, spec_id };
+      const char *suffixes[3] = { "_ai_state", "_ai_request", "_ai_result_spec" };
+      const int64_t lens[3] = { 32, 128, 4096 };
+      for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+        name_buf.reuse();
+        ObColumnSchemaV2 &hcol = *cols[k];
+        hcol.set_column_id(ids[k]);
+        hcol.set_table_id(table_schema.get_table_id());
+        hcol.set_data_type(ObVarcharType);
+        hcol.set_data_length(lens[k]);
+        hcol.set_nullable(true);
+        hcol.set_is_hidden(true);
+        hcol.set_charset_type(CHARSET_UTF8MB4);
+        hcol.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+        if (OB_FAIL(name_buf.append_fmt("%.*s%s", static_cast<int32_t>(
+                     ai_col->get_column_name_str().length()),
+                     ai_col->get_column_name_str().ptr(), suffixes[k]))) {
+        } else if (OB_FAIL(hcol.set_column_name(name_buf.string()))) {
+        } else if (OB_FAIL(table_schema.add_column(hcol))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ai_col->set_ai_state_column_id(state_id);
+        ai_col->set_ai_request_column_id(request_id);
+        ai_col->set_ai_result_spec_column_id(spec_id);
+      }
+    }
+  }
+  return ret;
+}
+
 }//end namespace sql
 }//end namespace oceanbase

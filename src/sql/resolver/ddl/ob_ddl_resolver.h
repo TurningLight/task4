@@ -529,6 +529,8 @@ protected:
                                                      bool& is_set_cur_default);
   int resolve_normal_column_attribute_constr_null(ObColumnSchemaV2 &column,
                                                   ObColumnResolveStat &resolve_stat);
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                      ParseNode *ai_attr_node);
   int resolve_normal_column_attribute(share::schema::ObColumnSchemaV2 &column,
                                       ParseNode *attrs_node,
                                       ObColumnResolveStat &reslove_stat,

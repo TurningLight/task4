@@ -372,7 +372,8 @@ END_P SET_VAR DELIMITER
 
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
-%type <node> sql_stmt stmt_list stmt opt_end_p
+%type <node> sql_stmt stmt_list stmt opt_end_p opt_ai_column_with_options ai_column_option_list ai_column_option
+%type <node> opt_ai_column_clause
 %type <node> select_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
@@ -4836,14 +4837,28 @@ SIMPLE { $$[0] = T_SIMPLE; }
 | PARTIAL { $$[0] = T_PARTIAL; }
 ;
 
-column_definition:
-column_definition_ref data_type opt_column_attribute_list opt_column_reference opt_position_column
+opt_ai_column_clause:
+/*EMPTY*/
 {
-  (void)($4);
+  $$ = NULL;
+}
+| AI COLUMN '(' expr ')' opt_ai_column_with_options
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ATTR, 2, $4, $6);
+}
+;
+
+column_definition:
+column_definition_ref data_type opt_column_attribute_list opt_ai_column_clause opt_column_reference opt_position_column
+{
+  (void)($5);
+  (void)($6);
   ParseNode *attributes = NULL;
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $3);
+  merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $4);
   set_data_type_collation($2, attributes, false, true);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $6);
 }
 | column_definition_ref data_type opt_collation opt_generated_keyname AS '(' expr ')' opt_storage_type opt_generated_column_attribute_list opt_column_reference opt_position_column
 {
@@ -18592,6 +18607,35 @@ ACCESSIBLE
 | XOR
 | YEAR_MONTH
 | ZEROFILL
+opt_ai_column_with_options:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  $$ = $3;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+NAME_OB COMP_EQ expr_or_default
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, $1, $3);
+}
+;
+
 %%
 ////////////////////////////////////////////////////////////////
 void yyerror(void *yylloc, ParseResult *p, char *s, ...)

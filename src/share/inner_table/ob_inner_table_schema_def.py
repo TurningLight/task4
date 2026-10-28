@@ -2446,6 +2446,53 @@ all_ai_model_endpoint_def = dict(
 )
 def_table_schema(**all_ai_model_endpoint_def)
 
+all_ai_column_def = dict(
+    owner = 'ai-column-comp',
+    table_name = '__all_ai_column',
+    table_id = '1131',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int')
+  ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('column_name', 'varchar:128', 'false'),
+        ('max_retries', 'int'),
+        ('state_column_id', 'int'),
+        ('request_column_id', 'int'),
+        ('result_spec_column_id', 'int'),
+        ('normalized_expr', 'varchar:4096', 'true'),
+        ('sync_mode', 'varchar:32', 'true')
+  ]
+)
+def_table_schema(**all_ai_column_def)
+
+all_ai_column_task_def = dict(
+    owner = 'ai-column-comp',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('task_id', 'int'),
+      ('table_id', 'int')
+  ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('request_id', 'varchar:128', 'false'),
+        ('ai_column_id', 'int', 'false'),
+        ('row_key', 'varchar:1024', 'true'),
+        ('task_state', 'varchar:32', 'false'),
+        ('retry_count', 'int'),
+        ('result_spec', 'varchar:4096', 'true')
+  ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',

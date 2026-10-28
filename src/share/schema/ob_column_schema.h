@@ -124,6 +124,21 @@ int assign(const ObColumnSchemaV2 &src_schema);
   //inline void set_new_nullable();
   inline void set_autoincrement(const bool is_autoincrement) { is_autoincrement_ = is_autoincrement; }
   inline void set_is_hidden(const bool is_hidden) { is_hidden_ = is_hidden; }
+  // ---- AI column metadata (competition) ----
+  inline void set_is_ai_column(const bool v) { is_ai_column_ = v; }
+  inline bool is_ai_column() const { return is_ai_column_; }
+  inline void set_ai_max_retries(const int32_t v) { ai_max_retries_ = v; }
+  inline int32_t get_ai_max_retries() const { return ai_max_retries_; }
+  inline void set_ai_state_column_id(const uint64_t v) { ai_state_column_id_ = v; }
+  inline uint64_t get_ai_state_column_id() const { return ai_state_column_id_; }
+  inline void set_ai_request_column_id(const uint64_t v) { ai_request_column_id_ = v; }
+  inline uint64_t get_ai_request_column_id() const { return ai_request_column_id_; }
+  inline void set_ai_result_spec_column_id(const uint64_t v) { ai_result_spec_column_id_ = v; }
+  inline uint64_t get_ai_result_spec_column_id() const { return ai_result_spec_column_id_; }
+  inline const common::ObString &get_ai_normalized_expr() const { return ai_normalized_expr_; }
+  inline int set_ai_normalized_expr(const common::ObString &v) { return deep_copy_str(v, ai_normalized_expr_); }
+  inline const common::ObString &get_ai_sync_mode() const { return ai_sync_mode_; }
+  inline int set_ai_sync_mode(const common::ObString &v) { return deep_copy_str(v, ai_sync_mode_); }
   inline void set_charset_type(const common::ObCharsetType type) { charset_type_ = type; }
   inline void set_index_position(const int64_t index_position) { index_position_ = index_position; }
   // The following two functions is not used for juding if column's type is binary.
@@ -398,6 +413,14 @@ private:
   ObSkipIndexColumnAttr skip_index_attr_;
   int64_t lob_chunk_size_;
   share::ObLocalSessionVar local_session_vars_;
+  // ---- AI column metadata (competition) ----
+  bool is_ai_column_;
+  int32_t ai_max_retries_;
+  uint64_t ai_state_column_id_;
+  uint64_t ai_request_column_id_;
+  uint64_t ai_result_spec_column_id_;
+  common::ObString ai_normalized_expr_;
+  common::ObString ai_sync_mode_;
 };
 
 inline int32_t ObColumnSchemaV2::get_data_length() const
