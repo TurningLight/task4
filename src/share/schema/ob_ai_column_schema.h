@@ -140,9 +140,9 @@ inline int ObAiColumnSchema::deep_copy(common::ObIAllocator &allocator,
 
 inline bool ObAiColumnSchema::is_valid() const
 {
-  // table_id_ is only final on the RS side, so it is deliberately not required
-  // here; an AI column is identified by its table's column id.
-  return common::OB_INVALID_ID != column_id_ && !column_name_.empty();
+  // neither table_id_ nor column_id_ is final when the resolver builds this
+  // struct (the RS assigns them), so only the name is required here.
+  return !column_name_.empty();
 }
 
 inline int64_t ObAiColumnSchema::get_serialize_size() const

@@ -835,7 +835,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           }
           // AI COLUMN: validate the clause and materialize the hidden columns
           if (OB_SUCC(ret) && OB_FAIL(resolve_ai_column_clause(*element, column, table_schema,
-                                                               true, cur_column_id_))) {
+                                                               false, cur_column_id_))) {
             SQL_RESV_LOG(WARN, "failed to resolve AI COLUMN clause", K(ret),
                          K(column.get_column_name_str()));
           }
@@ -936,6 +936,30 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       } else if (NULL == primary_node) {
         // do nothing
       } else if (OB_FAIL(resolve_primary_key_node(*primary_node, stats))) {
+      }
+      // AI COLUMN: materialize the hidden physical columns only after every user
+      // column got its id, otherwise the pre-assigned column ids of the columns
+      // that follow an AI column would interleave with the hidden ids.
+      if (OB_SUCC(ret)) {
+        common::ObSEArray<ObAiColumnSchema, 1> &ai_columns = table_schema.get_ai_column_schemas();
+        for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+          ObAiColumnSchema &ai_column = ai_columns.at(i);
+          if (common::OB_INVALID_ID != ai_column.get_state_column_id()) {
+            // already materialized
+          } else {
+            uint64_t state_column_id = common::OB_INVALID_ID;
+            uint64_t request_column_id = common::OB_INVALID_ID;
+            uint64_t result_spec_column_id = common::OB_INVALID_ID;
+            if (OB_FAIL(create_ai_column_hidden_columns(ai_column, table_schema, cur_column_id_,
+                        state_column_id, request_column_id, result_spec_column_id))) {
+              SQL_RESV_LOG(WARN, "create ai column hidden columns failed", K(ret), K(i));
+            } else {
+              ai_column.set_state_column_id(state_column_id);
+              ai_column.set_request_column_id(request_column_id);
+              ai_column.set_result_spec_column_id(result_spec_column_id);
+            }
+          }
+        }
       }
       if (OB_SUCC(ret)) {
         table_schema.set_max_used_column_id(cur_column_id_);

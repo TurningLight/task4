@@ -127,6 +127,37 @@ int get_declared_vector_dim(const ParseNode *type_node, int64_t &dim)
   return ret;
 }
 
+// Persist the AI column metadata on the hidden columns themselves.  The
+// create-table DDL path rebuilds the ObTableSchema on the RS side without
+// copying ai_column_schemas_, so the hidden columns (which are ordinary
+// columns and therefore always survive) are the durable carrier.
+int set_ai_hidden_column_comment(const int64_t idx,
+                                 const share::schema::ObAiColumnSchema &ai_column,
+                                 share::schema::ObColumnSchemaV2 &hidden_column)
+{
+  int ret = OB_SUCCESS;
+  char buf[64];
+  common::ObString comment;
+  if (0 == idx) {
+    int n = snprintf(buf, sizeof(buf), "AI_COLUMN:%ld:%d",
+                     static_cast<long>(ai_column.get_max_retries()),
+                     static_cast<int>(ai_column.get_sync_mode()));
+    if (OB_UNLIKELY(n <= 0 || n >= static_cast<int>(sizeof(buf)))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      comment.assign_ptr(buf, n);
+    }
+  } else if (1 == idx) {
+    comment = ai_column.get_normalized_expr();
+  }
+  if (OB_SUCC(ret) && !comment.empty()) {
+    if (OB_FAIL(hidden_column.set_comment(comment))) {
+      SQL_RESV_LOG(WARN, "set hidden column comment failed", K(ret), K(idx));
+    }
+  }
+  return ret;
+}
+
 int parse_ai_column_options(const ParseNode *options_node,
                             int64_t &max_retries,
                             share::schema::ObAiColumnSchema::SyncMode &sync_mode)
@@ -8317,6 +8348,8 @@ int ObDDLResolver::create_ai_column_hidden_columns(
     } else if (OB_FAIL(hidden_column.set_column_name(
                    common::ObString(static_cast<int32_t>(prefix_len + copy_len), name_buf)))) {
       SQL_RESV_LOG(WARN, "set hidden column name failed", K(ret));
+    } else if (OB_FAIL(ai_column_internal::set_ai_hidden_column_comment(
+                   i, ai_column, hidden_column))) {
     } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
       SQL_RESV_LOG(WARN, "add hidden ai column failed", K(ret), K(i));
     } else {

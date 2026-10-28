@@ -1382,6 +1382,74 @@ int ObTableSchema::get_ai_column_schema_by_column_id(
   return ret;
 }
 
+int ObTableSchema::rebuild_ai_column_schemas()
+{
+  int ret = OB_SUCCESS;
+  static const char *STATE_PREFIX = "__ai_state_";
+  const int32_t prefix_len = static_cast<int32_t>(strlen(STATE_PREFIX));
+  common::ObSqlString name_buf;
+  for (int64_t i = 0; OB_SUCC(ret) && i < get_column_count(); ++i) {
+    const ObColumnSchemaV2 *state_column = get_column_schema_by_idx(i);
+    if (OB_ISNULL(state_column) || !state_column->is_hidden()) {
+      // not a hidden column
+    } else {
+      const common::ObString &hidden_name = state_column->get_column_name_str();
+      if (hidden_name.length() <= prefix_len
+          || 0 != strncasecmp(hidden_name.ptr(), STATE_PREFIX, prefix_len)) {
+        // not the state column of an AI column
+      } else {
+        const common::ObString ai_column_name(hidden_name.length() - prefix_len,
+                                              hidden_name.ptr() + prefix_len);
+        const ObColumnSchemaV2 *ai_column = NULL;
+        const ObAiColumnSchema *known = NULL;
+        if (OB_FAIL(get_ai_column_schema_by_column_name(ai_column_name, known))) {
+        } else if (NULL != known) {
+          // already registered
+        } else if (OB_ISNULL(ai_column = get_column_schema(ai_column_name))) {
+          // the AI column is gone, ignore the orphan hidden column
+        } else {
+          const ObColumnSchemaV2 *request_column = NULL;
+          const ObColumnSchemaV2 *result_spec_column = NULL;
+          int64_t max_retries = 0;
+          int sync_mode = 0;
+          const common::ObString &meta = state_column->get_comment_str();
+          if (OB_UNLIKELY(meta.empty())) {
+            ret = OB_ERR_UNEXPECTED;
+            SHARE_SCHEMA_LOG(WARN, "ai column metadata comment is empty", KR(ret), K(hidden_name));
+          } else if (2 != sscanf(meta.ptr(), "AI_COLUMN:%ld:%d", &max_retries, &sync_mode)) {
+            ret = OB_ERR_UNEXPECTED;
+            SHARE_SCHEMA_LOG(WARN, "parse ai column metadata failed", KR(ret), K(meta));
+          } else if (OB_FAIL(name_buf.assign_fmt("__ai_request_%.*s",
+                         ai_column_name.length(), ai_column_name.ptr()))) {
+          } else if (OB_ISNULL(request_column = get_column_schema(name_buf.string()))) {
+            ret = OB_ERR_UNEXPECTED;
+            SHARE_SCHEMA_LOG(WARN, "request hidden column is missing", KR(ret), K(name_buf));
+          } else if (OB_FAIL(name_buf.assign_fmt("__ai_result_spec_%.*s",
+                         ai_column_name.length(), ai_column_name.ptr()))) {
+          } else if (OB_ISNULL(result_spec_column = get_column_schema(name_buf.string()))) {
+            ret = OB_ERR_UNEXPECTED;
+            SHARE_SCHEMA_LOG(WARN, "result_spec hidden column is missing", KR(ret), K(name_buf));
+          } else {
+            ObAiColumnSchema ai_column_schema;
+            ai_column_schema.set_table_id(get_table_id());
+            ai_column_schema.set_column_id(ai_column->get_column_id());
+            ai_column_schema.set_column_name(ai_column_name);
+            ai_column_schema.set_max_retries(max_retries);
+            ai_column_schema.set_sync_mode(static_cast<ObAiColumnSchema::SyncMode>(sync_mode));
+            ai_column_schema.set_state_column_id(state_column->get_column_id());
+            ai_column_schema.set_request_column_id(request_column->get_column_id());
+            ai_column_schema.set_result_spec_column_id(result_spec_column->get_column_id());
+            ai_column_schema.set_normalized_expr(request_column->get_comment_str());
+            if (OB_FAIL(add_ai_column_schema(ai_column_schema))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTableSchema::get_ai_column_schema_by_column_name(
     const common::ObString &column_name,
     const ObAiColumnSchema *&ai_column_schema) const

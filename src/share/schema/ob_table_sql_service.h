@@ -125,7 +125,7 @@ public:
                            const ObTableSchema &table,
                            const ObAiColumnSchema &ai_column);
   int batch_add_ai_columns_for_create_table(common::ObISQLClient &sql_client,
-                                            const common::ObIArray<ObTableSchema> &tables);
+                                            common::ObIArray<ObTableSchema> &tables);
   //alter table add column
   int insert_single_column(common::ObISQLClient &sql_client,
                            const ObTableSchema &new_table_schema,

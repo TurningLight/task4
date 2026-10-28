@@ -944,11 +944,18 @@ int ObTableSqlService::add_single_ai_column(common::ObISQLClient &sql_client,
 
 int ObTableSqlService::batch_add_ai_columns_for_create_table(
     common::ObISQLClient &sql_client,
-    const common::ObIArray<ObTableSchema> &tables)
+    common::ObIArray<ObTableSchema> &tables)
 {
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
-    const ObTableSchema &table = tables.at(i);
+    ObTableSchema &table = tables.at(i);
+    // the create-table DDL path rebuilds the schema, so recover the AI column
+    // metadata from the hidden physical columns before publishing it
+    if (!table.get_ai_column_schemas().empty() || is_inner_table(table.get_table_id())) {
+      // nothing to recover
+    } else if (OB_FAIL(table.rebuild_ai_column_schemas())) {
+      LOG_WARN("rebuild ai column schemas failed", KR(ret), K(i));
+    }
     for (int64_t j = 0; OB_SUCC(ret) && j < table.get_ai_column_schemas().count(); ++j) {
       if (OB_FAIL(add_single_ai_column(sql_client, table, table.get_ai_column_schemas().at(j)))) {
       }

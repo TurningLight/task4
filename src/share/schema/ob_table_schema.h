@@ -1066,6 +1066,9 @@ public:
                                         const ObAiColumnSchema *&ai_column_schema) const;
   int get_ai_column_schema_by_column_name(const common::ObString &column_name,
                                           const ObAiColumnSchema *&ai_column_schema) const;
+  // Rebuild ai_column_schemas_ from the hidden physical columns of this table.
+  // Idempotent: columns whose AI metadata is already registered are skipped.
+  int rebuild_ai_column_schemas();
   int delete_column(const common::ObString &column_name);
   int delete_all_view_columns();
   int alter_column(ObColumnSchemaV2 &column, ObColumnCheckMode check_mode, const bool for_view);
