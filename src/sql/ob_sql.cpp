@@ -24,6 +24,12 @@
 #include "sql/plan_cache/ob_ps_cache.h"
 #include "sql/plan_cache/ob_pcv_set.h"
 #include "sql/ob_sql_init.h"
+#include "lib/string/ob_sql_string.h"
+#include "sql/ob_sql_trans_control.h"
+#include "query/session/ob_inner_sql_connection_access.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/ob_server_struct.h"
 #include "sql/resolver/ob_resolver.h"
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "sql/resolver/cmd/ob_call_procedure_stmt.h"
@@ -171,6 +177,1108 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
   return ret;
 }
 
+// --------------------- AI COLUMN DML side effects ---------------------------
+// A DML statement that touches a table with AI columns has to invalidate the
+// stale AI results of the changed rows and maintain the async task queue, both
+// inside the caller's transaction.  Everything below runs through an inner
+// connection bound to the current session, so it joins that transaction and
+// rolls back with it.
+namespace ai_column_dml
+{
+
+static const char *const AI_STATE_COL_PREFIX = "__ai_state_";
+static const char *const AI_REQUEST_COL_PREFIX = "__ai_request_";
+static const char *const AI_TASK_TABLE_FULL_NAME = "oceanbase.__all_ai_column_task";
+
+static int64_t g_ai_column_request_id = 1;
+
+struct AiColumnDesc
+{
+  AiColumnDesc() : column_id_(common::OB_INVALID_ID), max_retries_(0), sync_mode_(0) {}
+  common::ObString column_name_;
+  uint64_t column_id_;
+  int64_t max_retries_;
+  int64_t sync_mode_;
+  common::ObString ai_expr_;
+};
+
+struct AiDmlState
+{
+  AiDmlState() : kind_(0), table_id_(common::OB_INVALID_ID), request_id_(0),
+                touched_(false), had_tx_(false) {}
+  void reset()
+  {
+    kind_ = 0;
+    table_id_ = common::OB_INVALID_ID;
+    request_id_ = 0;
+    touched_ = false;
+    had_tx_ = false;
+    ai_columns_.reuse();
+    pre_stmts_.reuse();
+    post_stmts_.reuse();
+    alloc_.reset();
+  }
+  // 0 = not an AI column statement, 1 = insert, 2 = update, 3 = delete
+  int kind_;
+  uint64_t table_id_;
+  int64_t request_id_;
+  bool touched_;
+  bool had_tx_;
+  common::ObArenaAllocator alloc_;
+  common::ObSEArray<AiColumnDesc, 4> ai_columns_;
+  common::ObSEArray<common::ObString, 4> pre_stmts_;
+  common::ObSEArray<common::ObString, 4> post_stmts_;
+};
+
+// forward declarations
+static thread_local int64_t g_ai_column_side_depth = 0;
+
+int ai_set_columns(const common::ObString &set_text, common::ObIArray<common::ObString> &cols);
+
+inline bool ai_space(const char c)
+{
+  return ' ' == c || '\t' == c || '\n' == c || '\r' == c || '\f' == c || '\v' == c;
+}
+
+inline bool ai_word_char(const char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || '_' == c;
+}
+
+common::ObString ai_sub(const common::ObString &src, const int32_t start, const int32_t len)
+{
+  common::ObString out;
+  if (start >= 0 && len > 0 && start + len <= src.length()) {
+    out.assign_ptr(const_cast<char *>(src.ptr()) + start, len);
+  }
+  return out;
+}
+
+inline char ai_lower(const char c)
+{
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+bool ai_match_word(const common::ObString &sql, const int64_t pos, const char *word)
+{
+  bool match = true;
+  const int64_t len = static_cast<int64_t>(strlen(word));
+  if (pos < 0 || pos + len > sql.length()) {
+    match = false;
+  } else {
+    for (int64_t i = 0; match && i < len; ++i) {
+      if (ai_lower(sql[pos + i]) != ai_lower(word[i])) {
+        match = false;
+      }
+    }
+    if (match && pos + len < sql.length() && ai_word_char(sql[pos + len])) {
+      match = false;
+    }
+    if (match && pos > 0 && ai_word_char(sql[pos - 1])) {
+      match = false;
+    }
+  }
+  return match;
+}
+
+common::ObString ai_copy_string(common::ObIAllocator &alloc, const common::ObString &src)
+{
+  common::ObString dst;
+  char *buf = nullptr;
+  if (!src.empty() && NULL != (buf = static_cast<char *>(alloc.alloc(src.length() + 1)))) {
+    MEMCPY(buf, src.ptr(), src.length());
+    buf[src.length()] = '\0';
+    dst.assign_ptr(buf, src.length());
+  }
+  return dst;
+}
+
+// index of the first top level occurrence of `word`, -1 when absent
+int64_t ai_find_word(const common::ObString &sql, const int64_t from, const char *word)
+{
+  int64_t found = -1;
+  int64_t depth = 0;
+  char quote = 0;
+  const int64_t len = sql.length();
+  for (int64_t i = from; -1 == found && i < len; ++i) {
+    const char c = sql[i];
+    if (0 != quote) {
+      if ('\\' == c) {
+        ++i;
+      } else if (c == quote) {
+        quote = 0;
+      }
+      continue;
+    }
+    if ('\'' == c || '"' == c || '`' == c) {
+      quote = c;
+      continue;
+    }
+    if ('-' == c && i + 1 < len && '-' == sql[i + 1]) {
+      while (i < len && '\n' != sql[i]) { ++i; }
+      continue;
+    }
+    if ('#' == c) {
+      while (i < len && '\n' != sql[i]) { ++i; }
+      continue;
+    }
+    if ('/' == c && i + 1 < len && '*' == sql[i + 1]) {
+      i += 2;
+      while (i + 1 < len && !('*' == sql[i] && '/' == sql[i + 1])) { ++i; }
+      ++i;
+      continue;
+    }
+    if ('(' == c) {
+      ++depth;
+      continue;
+    }
+    if (')' == c) {
+      if (depth > 0) { --depth; }
+      continue;
+    }
+    if (0 != depth) {
+      continue;
+    }
+    if (ai_word_char(c) && (0 == i || !ai_word_char(sql[i - 1]))
+        && ai_match_word(sql, i, word)) {
+      found = i;
+    }
+  }
+  return found;
+}
+
+int ai_read_ident(const common::ObString &sql, int64_t &pos, common::ObString &ident)
+{
+  int ret = OB_SUCCESS;
+  while (pos < sql.length() && ai_space(sql[pos])) { ++pos; }
+  if (pos >= sql.length()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if ('`' == sql[pos]) {
+    const int64_t start = ++pos;
+    while (pos < sql.length() && '`' != sql[pos]) { ++pos; }
+    ident.assign_ptr(sql.ptr() + start, static_cast<int32_t>(pos - start));
+    if (pos < sql.length()) { ++pos; }
+  } else if (ai_word_char(sql[pos])) {
+    const int64_t start = pos;
+    while (pos < sql.length() && ai_word_char(sql[pos])) { ++pos; }
+    ident.assign_ptr(sql.ptr() + start, static_cast<int32_t>(pos - start));
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+
+int ai_read_table_name(const common::ObString &sql,
+                       int64_t &pos,
+                       common::ObString &db_name,
+                       common::ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  common::ObString first;
+  db_name.reset();
+  table_name.reset();
+  if (OB_FAIL(ai_read_ident(sql, pos, first))) {
+  } else {
+    int64_t peek = pos;
+    while (peek < sql.length() && ai_space(sql[peek])) { ++peek; }
+    if (peek < sql.length() && '.' == sql[peek]) {
+      pos = peek + 1;
+      db_name = first;
+      if (OB_FAIL(ai_read_ident(sql, pos, table_name))) {
+      }
+    } else {
+      table_name = first;
+    }
+  }
+  return ret;
+}
+
+int ai_scan_stmt(const common::ObString &stmt,
+                 int64_t &kind,
+                 common::ObString &db_name,
+                 common::ObString &table_name,
+                 common::ObString &where_text,
+                 int64_t &where_pos,
+                 int64_t &values_pos)
+{
+  int ret = OB_SUCCESS;
+  kind = 0;
+  where_pos = -1;
+  values_pos = -1;
+  where_text.reset();
+  int64_t pos = 0;
+  while (pos < stmt.length() && ai_space(stmt[pos])) { ++pos; }
+  if (ai_match_word(stmt, pos, "insert")) {
+    kind = 1;
+    const int64_t into = ai_find_word(stmt, pos + 6, "into");
+    pos = (-1 == into) ? pos + 6 : into + 4;
+  } else if (ai_match_word(stmt, pos, "update")) {
+    kind = 2;
+    pos += 6;
+  } else if (ai_match_word(stmt, pos, "delete")) {
+    const int64_t from = ai_find_word(stmt, pos + 6, "from");
+    if (-1 == from) {
+      kind = 0;
+    } else {
+      kind = 3;
+      pos = from + 4;
+    }
+  }
+  if (0 != kind && OB_FAIL(ai_read_table_name(stmt, pos, db_name, table_name))) {
+    kind = 0;
+  }
+  if (1 == kind) {
+    values_pos = ai_find_word(stmt, pos, "values");
+  }
+  if (0 != kind && (2 == kind || 3 == kind)) {
+    where_pos = ai_find_word(stmt, pos, "where");
+    if (-1 != where_pos) {
+      where_text = ai_sub(stmt, static_cast<int32_t>(where_pos + 5),
+                                 stmt.length() - static_cast<int32_t>(where_pos + 5));
+      while (!where_text.empty()
+             && (ai_space(where_text[where_text.length() - 1])
+                 || ';' == where_text[where_text.length() - 1])) {
+        where_text.assign_ptr(where_text.ptr(), where_text.length() - 1);
+      }
+    }
+  }
+  return ret;
+}
+
+void ai_parse_state_comment(const common::ObString &comment, int64_t &max_retries, int64_t &sync_mode)
+{
+  int64_t vals[2] = {0, 0};
+  int64_t idx = 0;
+  int64_t i = 0;
+  while (i < comment.length() && idx < 2) {
+    if (comment[i] >= '0' && comment[i] <= '9') {
+      int64_t value = 0;
+      while (i < comment.length() && comment[i] >= '0' && comment[i] <= '9') {
+        value = value * 10 + (comment[i] - '0');
+        ++i;
+      }
+      vals[idx++] = value;
+    } else {
+      ++i;
+    }
+  }
+  max_retries = vals[0];
+  sync_mode = vals[1];
+}
+
+// the normalized expression is stored as "<type hint>\n<raw expression>"
+common::ObString ai_tail_line(const common::ObString &text)
+{
+  int32_t pos = -1;
+  for (int32_t i = text.length() - 1; i >= 0; --i) {
+    if ('\n' == text[i]) {
+      pos = i;
+      break;
+    }
+  }
+  return pos < 0 ? text : ai_sub(text, pos + 1, text.length() - pos - 1);
+}
+
+int ai_derive_columns(common::ObIAllocator &alloc,
+                      const share::schema::ObTableSchema &table_schema,
+                      common::ObIArray<AiColumnDesc> &columns)
+{
+  int ret = OB_SUCCESS;
+  const int64_t prefix_len = static_cast<int64_t>(strlen(AI_STATE_COL_PREFIX));
+  for (share::schema::ObTableSchema::const_column_iterator it = table_schema.column_begin();
+       OB_SUCC(ret) && it != table_schema.column_end();
+       ++it) {
+    const share::schema::ObColumnSchemaV2 *column = *it;
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!column->is_hidden()) {
+      // user visible result column, not metadata
+    } else {
+      const common::ObString name = column->get_column_name_str();
+      if (name.length() <= prefix_len
+          || 0 != strncasecmp(name.ptr(), AI_STATE_COL_PREFIX, prefix_len)) {
+        // not an AI column hidden column
+      } else {
+        AiColumnDesc desc;
+        const common::ObString suffix = ai_sub(name, static_cast<int32_t>(prefix_len),
+                                               name.length() - static_cast<int32_t>(prefix_len));
+        desc.column_name_ = ai_copy_string(alloc, suffix);
+        ai_parse_state_comment(column->get_comment_str(), desc.max_retries_, desc.sync_mode_);
+        char request_name[OB_MAX_COLUMN_NAME_LENGTH + 1];
+        const int32_t n = snprintf(request_name, sizeof(request_name), "%s%.*s",
+                                   AI_REQUEST_COL_PREFIX,
+                                   suffix.length(), suffix.ptr());
+        const share::schema::ObColumnSchemaV2 *request_column = nullptr;
+        const share::schema::ObColumnSchemaV2 *result_column = nullptr;
+        if (n <= 0 || n >= static_cast<int32_t>(sizeof(request_name))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (NULL != (request_column = table_schema.get_column_schema(request_name))) {
+          desc.ai_expr_ = ai_copy_string(alloc, ai_tail_line(request_column->get_comment_str()));
+        }
+        if (OB_SUCC(ret)) {
+          if (NULL == (result_column = table_schema.get_column_schema(suffix))) {
+            // the AI column disappeared, ignore it
+          } else {
+            desc.column_id_ = result_column->get_column_id();
+            if (OB_FAIL(columns.push_back(desc))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+
+// split on top level commas (parens and quotes aware)
+int ai_split_top_commas(const common::ObString &text,
+                        const bool strip_parens,
+                        common::ObIArray<common::ObString> &out)
+{
+  int ret = OB_SUCCESS;
+  int64_t depth = 0;
+  char quote = 0;
+  int64_t start = 0;
+  if (strip_parens) {
+    while (start < text.length() && (ai_space(text[start]) || '(' == text[start])) { ++start; }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i <= text.length(); ++i) {
+    const char c = (i < text.length()) ? text[i] : ',';
+    if (0 != quote) {
+      if ('\\' == c) { ++i; }
+      else if (c == quote) { quote = 0; }
+      continue;
+    }
+    if ('\'' == c || '"' == c || '`' == c) { quote = c; continue; }
+    if ('(' == c) { ++depth; continue; }
+    if (')' == c) {
+      if (depth > 0) { --depth; }
+      if (0 == depth && strip_parens && i <= text.length()) {
+        // end of a values tuple
+        int64_t end = i;
+        while (end > start && ai_space(text[end - 1])) { --end; }
+        if (end > start && OB_FAIL(out.push_back(ai_sub(text, static_cast<int32_t>(start),
+                                                        static_cast<int32_t>(end - start))))) {
+        }
+        // skip to the next '(' or ','
+        int64_t j = i + 1;
+        while (j < text.length() && (ai_space(text[j]) || ',' == text[j])) { ++j; }
+        start = j;
+        i = j - 1;
+        break;
+      }
+      continue;
+    }
+    if (',' == c && 0 == depth) {
+      int64_t end = i;
+      while (end > start && ai_space(text[end - 1])) { --end; }
+      if (end > start && OB_FAIL(out.push_back(ai_sub(text, static_cast<int32_t>(start),
+                                                      static_cast<int32_t>(end - start))))) {
+      }
+      start = i + 1;
+      while (start < text.length() && ai_space(text[start])) { ++start; }
+    }
+  }
+  return ret;
+}
+
+// split the VALUES clause into tuples, each tuple into its value expressions
+int ai_split_values(const common::ObString &values_text,
+                    common::ObIArray<common::ObString> &tuples)
+{
+  int ret = OB_SUCCESS;
+  int64_t depth = 0;
+  char quote = 0;
+  int64_t start = -1;
+  for (int64_t i = 0; OB_SUCC(ret) && i < values_text.length(); ++i) {
+    const char c = values_text[i];
+    if (0 != quote) {
+      if ('\\' == c) { ++i; }
+      else if (c == quote) { quote = 0; }
+      continue;
+    }
+    if ('\'' == c || '"' == c || '`' == c) { quote = c; continue; }
+    if ('(' == c) {
+      if (0 == depth) { start = i; }
+      ++depth;
+      continue;
+    }
+    if (')' == c) {
+      if (depth > 0) { --depth; }
+      if (0 == depth && start >= 0) {
+        if (OB_FAIL(tuples.push_back(ai_sub(values_text, static_cast<int32_t>(start),
+                                            static_cast<int32_t>(i - start + 1))))) {
+        }
+        start = -1;
+      }
+      continue;
+    }
+  }
+  return ret;
+}
+
+// index of `name` inside a column list (case insensitive), -1 when absent
+int64_t ai_column_index(const common::ObIArray<common::ObString> &columns,
+                        const common::ObString &name)
+{
+  int64_t index = -1;
+  for (int64_t i = 0; -1 == index && i < columns.count(); ++i) {
+    common::ObString column = columns.at(i);
+    int32_t b = 0;
+    int32_t e = column.length() - 1;
+    while (b <= e && (ai_space(column[b]) || '`' == column[b])) { ++b; }
+    while (e >= b && (ai_space(column[e]) || '`' == column[e])) { --e; }
+    if (e >= b && 0 == ai_sub(column, b, e - b + 1).case_compare(name)) {
+      index = i;
+    }
+  }
+  return index;
+}
+
+int ai_append_escaped(common::ObSqlString &sql, const common::ObString &text)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("'"))) {
+  }
+  for (int32_t i = 0; OB_SUCC(ret) && i < text.length(); ++i) {
+    const char c = text[i];
+    if ('\'' == c) {
+      ret = sql.append("''");
+    } else if ('\\' == c) {
+      ret = sql.append("\\\\");
+    } else {
+      ret = sql.append(&c, 1);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = sql.append("'");
+  }
+  return ret;
+}
+
+// concat('`k1` = ', t.k1, ' and ', '`k2` = ', t.k2)
+int ai_append_predicate(common::ObSqlString &sql,
+                        const share::schema::ObTableSchema &table_schema,
+                        const char *alias)
+{
+  int ret = OB_SUCCESS;
+  const common::ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+  if (OB_FAIL(sql.append("concat("))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_info.get_size(); ++i) {
+    uint64_t column_id = common::OB_INVALID_ID;
+    const share::schema::ObColumnSchemaV2 *column = nullptr;
+    common::ObString name;
+    if (OB_FAIL(rowkey_info.get_column_id(i, column_id))) {
+    } else if (OB_ISNULL(column = table_schema.get_column_schema(column_id))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (FALSE_IT(name = column->get_column_name_str())) {
+    } else if (OB_FAIL(sql.append_fmt("%s'`%.*s` = ', %s.%.*s",
+                                      i > 0 ? "' and ', " : "",
+                                      name.length(), name.ptr(),
+                                      alias, name.length(), name.ptr()))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = sql.append(")");
+  }
+  return ret;
+}
+
+int ai_build_qualified_name(common::ObSqlString &sql,
+                            const common::ObString &db_name,
+                            const common::ObString &table_name)
+{
+  return sql.append_fmt("`%.*s`.`%.*s`", db_name.length(), db_name.ptr(),
+                        table_name.length(), table_name.ptr());
+}
+
+int ai_build_task_insert(common::ObSqlString &sql,
+                         const share::schema::ObTableSchema &table_schema,
+                         const AiColumnDesc &desc,
+                         const uint64_t table_id,
+                         const int64_t request_id,
+                         const common::ObString &db_name,
+                         const common::ObString &table_name,
+                         const common::ObString &where_text)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString predicate;
+  common::ObSqlString qualified;
+  if (OB_FAIL(ai_append_predicate(predicate, table_schema, "t"))) {
+  } else if (OB_FAIL(ai_build_qualified_name(qualified, db_name, table_name))) {
+  } else if (OB_FAIL(sql.append_fmt("insert into %s (table_id, request_id, column_id, state, "
+                                    "retry_count, eligible_ts, rowkey_predicate, column_name, "
+                                    "ai_expr, max_retries, target_type) select %lu, %ld, %lu, "
+                                    "0, 0, now(6), %.*s, '%.*s', ",
+                                    AI_TASK_TABLE_FULL_NAME,
+                                    static_cast<unsigned long>(table_id), request_id,
+                                    static_cast<unsigned long>(desc.column_id_),
+                                    predicate.string().length(), predicate.string().ptr(),
+                                    desc.column_name_.length(), desc.column_name_.ptr()))) {
+  } else if (OB_FAIL(ai_append_escaped(sql, desc.ai_expr_))) {
+  } else if (OB_FAIL(sql.append_fmt(", %ld, 0 from %.*s t where t.`%.*s` is null"
+                                    "%s%.*s%s and not exists "
+                                    "(select 1 from %s k where k.table_id = %lu and "
+                                    "k.column_id = %lu and k.rowkey_predicate = %.*s)",
+                                    desc.max_retries_,
+                                    qualified.length(), qualified.ptr(),
+                                    desc.column_name_.length(), desc.column_name_.ptr(),
+                                    where_text.empty() ? "" : " and (",
+                                    where_text.length(), where_text.ptr(),
+                                    where_text.empty() ? "" : ")",
+                                    AI_TASK_TABLE_FULL_NAME,
+                                    static_cast<unsigned long>(table_id),
+                                    static_cast<unsigned long>(desc.column_id_),
+                                    predicate.string().length(), predicate.string().ptr()))) {
+  }
+  return ret;
+}
+
+
+// Build one task row per VALUES tuple; the rowkey predicate is rendered straight
+// from the statement text so the hook never has to read rows that do not exist.
+int ai_build_insert_tasks(common::ObSqlString &sql,
+                          const share::schema::ObTableSchema &table_schema,
+                          const AiColumnDesc &desc,
+                          const uint64_t table_id,
+                          const int64_t request_id,
+                          const common::ObString &stmt,
+                          const int64_t values_pos,
+                          const common::ObString &db_name,
+                          const common::ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  const common::ObString values_text = ai_sub(stmt, static_cast<int32_t>(values_pos),
+                                              stmt.length() - static_cast<int32_t>(values_pos));
+  common::ObSEArray<common::ObString, 8> tuples;
+  common::ObSEArray<common::ObString, 8> columns;
+  const common::ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+  // column list between the table name and `values`
+  int64_t lp = -1;
+  {
+    int64_t pos = 0;
+    while (pos < values_pos && '(' != stmt[pos]) { ++pos; }
+    if (pos < values_pos) {
+      int64_t depth = 0;
+      char quote = 0;
+      for (int64_t i = pos; i < values_pos; ++i) {
+        const char c = stmt[i];
+        if (0 != quote) {
+          if (c == quote) { quote = 0; }
+          continue;
+        }
+        if ('\'' == c || '"' == c || '`' == c) { quote = c; continue; }
+        if ('(' == c) {
+          if (0 == depth) { lp = i + 1; }
+          ++depth;
+        } else if (')' == c) {
+          if (depth > 0) { --depth; }
+          if (0 == depth && lp > 0) {
+            common::ObString list = ai_sub(stmt, static_cast<int32_t>(lp),
+                                           static_cast<int32_t>(i - lp));
+            if (OB_FAIL(ai_split_top_commas(list, false, columns))) {
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ai_split_values(values_text, tuples))) {
+    }
+  }
+  for (int64_t t = 0; OB_SUCC(ret) && t < tuples.count(); ++t) {
+    common::ObSEArray<common::ObString, 8> values;
+    common::ObSqlString predicate;
+    if (OB_FAIL(ai_split_top_commas(ai_sub(tuples.at(t), 1, tuples.at(t).length() - 2),
+                                    false, values))) {
+    } else if (OB_FAIL(predicate.append("concat("))) {
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < rowkey_info.get_size(); ++k) {
+      uint64_t column_id = common::OB_INVALID_ID;
+      const share::schema::ObColumnSchemaV2 *pk_column = nullptr;
+      if (OB_FAIL(rowkey_info.get_column_id(k, column_id))) {
+      } else if (OB_ISNULL(pk_column = table_schema.get_column_schema(column_id))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const common::ObString pk_name = pk_column->get_column_name_str();
+        int64_t index = columns.empty() ? -1 : ai_column_index(columns, pk_name);
+        if (columns.empty()) {
+          // no column list: fall back to the table column order
+          int64_t nth = 0;
+          for (share::schema::ObTableSchema::const_column_iterator it = table_schema.column_begin();
+               OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+            const share::schema::ObColumnSchemaV2 *column = *it;
+            if (OB_ISNULL(column)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (!column->is_user_visible_column()) {
+              // hidden columns are not part of the values
+            } else if (column->get_column_id() == column_id) {
+              index = nth;
+              break;
+            } else {
+              ++nth;
+            }
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (index < 0 || index >= values.count()) {
+          ret = OB_ERR_UNEXPECTED;  // primary key not provided, leave it alone
+        } else if (OB_FAIL(predicate.append_fmt("%s'`%.*s` = ', %.*s",
+                                                k > 0 ? "' and ', " : "",
+                                                pk_name.length(), pk_name.ptr(),
+                                                values.at(index).length(),
+                                                values.at(index).ptr()))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(predicate.append(")"))) {
+    }
+    if (OB_SUCC(ret) && OB_FAIL(sql.append_fmt("insert into %s (table_id, request_id, column_id, "
+                                               "state, retry_count, eligible_ts, rowkey_predicate, "
+                                               "column_name, ai_expr, max_retries, target_type) select "
+                                               "%lu, %ld, %lu, 0, 0, now(6), %.*s, '%.*s', ",
+                                               AI_TASK_TABLE_FULL_NAME,
+                                               static_cast<unsigned long>(table_id), request_id,
+                                               static_cast<unsigned long>(desc.column_id_),
+                                               predicate.string().length(),
+                                               predicate.string().ptr(),
+                                               desc.column_name_.length(),
+                                               desc.column_name_.ptr()))) {
+    } else if (OB_FAIL(ai_append_escaped(sql, desc.ai_expr_))) {
+    } else if (OB_FAIL(sql.append_fmt(", %ld, 0 where not exists (select 1 from %s k "
+                                      "where k.table_id = %lu and k.column_id = %lu and "
+                                      "k.rowkey_predicate = %.*s)",
+                                      desc.max_retries_, AI_TASK_TABLE_FULL_NAME,
+                                      static_cast<unsigned long>(table_id),
+                                      static_cast<unsigned long>(desc.column_id_),
+                                      predicate.string().length(),
+                                      predicate.string().ptr()))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_DEBUG("AICOL insert task sql", K(sql), K(db_name), K(table_name), K(tuples.count()));
+  }
+  return ret;
+}
+
+
+// predicate of an update: a primary key column overwritten by the SET clause
+// has to be rendered from the new value, every other key stays as it is
+int ai_append_predicate_after_update(common::ObSqlString &sql,
+                                     const share::schema::ObTableSchema &table_schema,
+                                     const common::ObString &set_text,
+                                     const char *alias)
+{
+  int ret = OB_SUCCESS;
+  const common::ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+  common::ObSEArray<common::ObString, 8> set_cols;
+  common::ObSEArray<common::ObString, 8> set_exprs;
+  if (OB_FAIL(ai_set_columns(set_text, set_cols))) {
+  }
+  // collect the expressions of the SET clause in the same order
+  {
+    int64_t depth = 0;
+    char quote = 0;
+    int64_t item_start = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i <= set_text.length(); ++i) {
+      const char c = (i < set_text.length()) ? set_text[i] : ',';
+      if (0 != quote) { if (c == quote) { quote = 0; } continue; }
+      if ('\'' == c || '"' == c || '`' == c) { quote = c; continue; }
+      if ('(' == c) { ++depth; continue; }
+      if (')' == c) { if (depth > 0) { --depth; } continue; }
+      if (',' != c || 0 != depth) { continue; }
+      const common::ObString item = ai_sub(set_text, static_cast<int32_t>(item_start),
+                                           static_cast<int32_t>(i - item_start));
+      item_start = i + 1;
+      int32_t eq = -1;
+      for (int32_t j = 0; j < item.length(); ++j) {
+        if ('=' == item[j]) { eq = j; break; }
+      }
+      if (eq > 0 && OB_FAIL(set_exprs.push_back(ai_sub(item, eq + 1,
+                                                       item.length() - eq - 1)))) {
+      }
+    }
+  }
+  if (OB_FAIL(sql.append("concat("))) {
+  }
+  for (int64_t k = 0; OB_SUCC(ret) && k < rowkey_info.get_size(); ++k) {
+    uint64_t column_id = common::OB_INVALID_ID;
+    const share::schema::ObColumnSchemaV2 *pk_column = nullptr;
+    if (OB_FAIL(rowkey_info.get_column_id(k, column_id))) {
+    } else if (OB_ISNULL(pk_column = table_schema.get_column_schema(column_id))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const common::ObString pk_name = pk_column->get_column_name_str();
+      const int64_t index = ai_column_index(set_cols, pk_name);
+      const bool has_new_value = (index >= 0 && index < set_exprs.count());
+      if (OB_FAIL(sql.append_fmt("%s'`%.*s` = ', %s", k > 0 ? "' and ', " : "",
+                                 pk_name.length(), pk_name.ptr(),
+                                 has_new_value ? "" : alias))) {
+      } else if (has_new_value
+                 && OB_FAIL(sql.append_fmt("%.*s", set_exprs.at(index).length(),
+                                           set_exprs.at(index).ptr()))) {
+      } else if (!has_new_value
+                 && OB_FAIL(sql.append_fmt(".%.*s", pk_name.length(), pk_name.ptr()))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = sql.append(")");
+  }
+  return ret;
+}
+
+int ai_build_task_insert_of_update(common::ObSqlString &sql,
+                                   const share::schema::ObTableSchema &table_schema,
+                                   const AiColumnDesc &desc,
+                                   const uint64_t table_id,
+                                   const int64_t request_id,
+                                   const common::ObString &db_name,
+                                   const common::ObString &table_name,
+                                   const common::ObString &where_text,
+                                   const common::ObString &set_text)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString predicate;
+  common::ObSqlString qualified;
+  if (OB_FAIL(ai_append_predicate_after_update(predicate, table_schema, set_text, "t"))) {
+  } else if (OB_FAIL(ai_build_qualified_name(qualified, db_name, table_name))) {
+  } else if (OB_FAIL(sql.append_fmt("insert into %s (table_id, request_id, column_id, state, "
+                                    "retry_count, eligible_ts, rowkey_predicate, column_name, "
+                                    "ai_expr, max_retries, target_type) select %lu, %ld, %lu, "
+                                    "0, 0, now(6), %.*s, '%.*s', ",
+                                    AI_TASK_TABLE_FULL_NAME,
+                                    static_cast<unsigned long>(table_id), request_id,
+                                    static_cast<unsigned long>(desc.column_id_),
+                                    predicate.string().length(), predicate.string().ptr(),
+                                    desc.column_name_.length(), desc.column_name_.ptr()))) {
+  } else if (OB_FAIL(ai_append_escaped(sql, desc.ai_expr_))) {
+  } else if (OB_FAIL(sql.append_fmt(", %ld, 0 from %.*s t where %.*s",
+                                    desc.max_retries_,
+                                    qualified.length(), qualified.ptr(),
+                                    where_text.length(), where_text.ptr()))) {
+  }
+  return ret;
+}
+
+int ai_build_task_cleanup(common::ObSqlString &sql,
+                          const share::schema::ObTableSchema &table_schema,
+                          const uint64_t table_id,
+                          const common::ObString &db_name,
+                          const common::ObString &table_name,
+                          const common::ObString &where_text)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString predicate;
+  common::ObSqlString qualified;
+  if (OB_FAIL(ai_append_predicate(predicate, table_schema, "t"))) {
+  } else if (OB_FAIL(ai_build_qualified_name(qualified, db_name, table_name))) {
+  } else if (OB_FAIL(sql.append_fmt("delete from %s where table_id = %lu and rowkey_predicate in "
+                                    "(select %.*s from %.*s t where %.*s)",
+                                    AI_TASK_TABLE_FULL_NAME, static_cast<unsigned long>(table_id),
+                                    predicate.string().length(), predicate.string().ptr(),
+                                    qualified.length(), qualified.ptr(),
+                                    where_text.length(), where_text.ptr()))) {
+  }
+  return ret;
+}
+
+int ai_build_invalidate(common::ObSqlString &sql,
+                        const common::ObIArray<AiColumnDesc> &columns,
+                        const common::ObString &db_name,
+                        const common::ObString &table_name,
+                        const common::ObString &where_text)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString qualified;
+  if (OB_FAIL(ai_build_qualified_name(qualified, db_name, table_name))) {
+  } else if (OB_FAIL(sql.append_fmt("update %.*s set ", qualified.length(), qualified.ptr()))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    if (OB_FAIL(sql.append_fmt("%s`%.*s` = NULL", i > 0 ? ", " : "",
+                               columns.at(i).column_name_.length(),
+                               columns.at(i).column_name_.ptr()))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = sql.append_fmt(" where %.*s", where_text.length(), where_text.ptr());
+  }
+  return ret;
+}
+
+int ai_store_stmt(common::ObIAllocator &alloc,
+                  common::ObIArray<common::ObString> &stmts,
+                  const common::ObSqlString &sql)
+{
+  common::ObString copy = ai_copy_string(alloc, sql.string());
+  return copy.empty() ? OB_ALLOCATE_MEMORY_FAILED : stmts.push_back(copy);
+}
+
+bool ai_word_in_text(const common::ObString &text, const common::ObString &word)
+{
+  bool found = false;
+  if (!word.empty() && word.length() <= text.length()) {
+    for (int32_t i = 0; !found && i + word.length() <= text.length(); ++i) {
+      if (0 == strncasecmp(text.ptr() + i, word.ptr(), word.length())) {
+        const bool left_ok = (0 == i) || !ai_word_char(text[i - 1]);
+        const bool right_ok = (i + word.length() >= text.length())
+                              || !ai_word_char(text[i + word.length()]);
+        if (left_ok && right_ok) {
+          found = true;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+// left hand side column names of a SET clause
+int ai_set_columns(const common::ObString &set_text, common::ObIArray<common::ObString> &cols)
+{
+  int ret = OB_SUCCESS;
+  int64_t depth = 0;
+  char quote = 0;
+  int64_t item_start = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i <= set_text.length(); ++i) {
+    const char c = (i < set_text.length()) ? set_text[i] : ',';
+    if (0 != quote) {
+      if (c == quote) { quote = 0; }
+      continue;
+    }
+    if ('\'' == c || '"' == c || '`' == c) { quote = c; continue; }
+    if ('(' == c) { ++depth; continue; }
+    if (')' == c) { if (depth > 0) { --depth; } continue; }
+    if (',' != c || 0 != depth) { continue; }
+    const common::ObString item = ai_sub(set_text, static_cast<int32_t>(item_start),
+                                         static_cast<int32_t>(i - item_start));
+    item_start = i + 1;
+    int32_t eq = -1;
+    for (int32_t j = 0; j < item.length(); ++j) {
+      if ('=' == item[j]) { eq = j; break; }
+    }
+    const common::ObString lhs = (eq > 0) ? ai_sub(item, 0, eq) : item;
+    int32_t b = 0;
+    int32_t e = lhs.length() - 1;
+    while (b <= e && (ai_space(lhs[b]) || '`' == lhs[b])) { ++b; }
+    while (e >= b && (ai_space(lhs[e]) || '`' == lhs[e])) { --e; }
+    if (e >= b && OB_FAIL(cols.push_back(ai_sub(lhs, b, e - b + 1)))) {
+    }
+  }
+  return ret;
+}
+
+// does the SET clause write a column the AI expression reads?
+bool ai_text_references(const AiColumnDesc &desc, const common::ObString &set_text)
+{
+  bool touched = false;
+  common::ObSEArray<common::ObString, 8> set_cols;
+  if (OB_SUCCESS == ai_set_columns(set_text, set_cols)) {
+    for (int64_t i = 0; !touched && i < set_cols.count(); ++i) {
+      if (ai_word_in_text(desc.ai_expr_, set_cols.at(i))) {
+        touched = true;
+      }
+    }
+  }
+  return touched;
+}
+
+// does the SET clause write a primary key column?
+bool ai_set_touches_pk(const share::schema::ObTableSchema &table_schema,
+                       const common::ObString &set_text)
+{
+  bool touched = false;
+  common::ObSEArray<common::ObString, 8> set_cols;
+  const common::ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+  if (OB_SUCCESS == ai_set_columns(set_text, set_cols)) {
+    for (int64_t i = 0; !touched && i < rowkey_info.get_size(); ++i) {
+      uint64_t column_id = common::OB_INVALID_ID;
+      const share::schema::ObColumnSchemaV2 *column = nullptr;
+      if (OB_SUCCESS == rowkey_info.get_column_id(i, column_id)
+          && NULL != (column = table_schema.get_column_schema(column_id))) {
+        const common::ObString name = column->get_column_name_str();
+        for (int64_t j = 0; !touched && j < set_cols.count(); ++j) {
+          if (0 == set_cols.at(j).case_compare(name)) {
+            touched = true;
+          }
+        }
+      }
+    }
+  }
+  return touched;
+}
+
+
+int ai_exec(ObSQLSessionInfo &session, const common::ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  common::sqlclient::ObISQLConnectionGuard conn_guard;
+  common::sqlclient::ObISQLConnection *conn = nullptr;
+  int64_t affected_rows = 0;
+  if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_spi_connection_with_external_session(
+                &session, conn_guard))) {
+  } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    LOG_DEBUG("AICOL side exec begin", K(sql), KP(&session), KP(session.get_tx_desc()), KP(conn));
+    ++g_ai_column_side_depth;
+    if (OB_FAIL(conn->execute_write(sql, affected_rows))) {
+      LOG_WARN("ai column side statement failed", KR(ret), K(sql));
+    } else {
+      LOG_DEBUG("AICOL side exec done", K(sql), K(affected_rows));
+    }
+    --g_ai_column_side_depth;
+  }
+  return ret;
+}
+
+// Analyse the statement and pre-build every side statement.  A DML must never
+// break because of the AI bookkeeping, so failures only disable the hook.
+int ai_prepare(ObSQLSessionInfo &session, const common::ObString &stmt, AiDmlState &state)
+{
+  int ret = OB_SUCCESS;
+  int64_t kind = 0;
+  common::ObString db_name;
+  common::ObString table_name;
+  common::ObString where_text;
+  common::ObString set_text;
+  int64_t where_pos = -1;
+  int64_t values_pos = -1;
+  state.reset();
+  if (g_ai_column_side_depth > 0) {
+    // re-entrant statement from our own side effects, nothing to do
+  } else if (OB_FAIL(ai_scan_stmt(stmt, kind, db_name, table_name, where_text, where_pos,
+                                  values_pos))) {
+  } else if (0 == kind || table_name.empty()) {
+    // not a DML statement we care about
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    share::schema::ObSchemaGetterGuard guard;
+    const share::schema::ObTableSchema *table_schema = nullptr;
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
+    } else if (db_name.empty()) {
+      db_name = session.get_database_name();
+    }
+    if (OB_FAIL(ret)) {
+    } else if (db_name.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(guard.get_table_schema(db_name, table_name, false, table_schema))) {
+    } else if (OB_ISNULL(table_schema)) {
+      // unknown table, the normal resolver reports it
+    } else if (OB_FAIL(ai_derive_columns(state.alloc_, *table_schema, state.ai_columns_))) {
+    } else if (state.ai_columns_.empty()) {
+      // no AI column on this table
+    } else {
+      state.kind_ = static_cast<int>(kind);
+      state.had_tx_ = (NULL != session.get_tx_desc());
+      state.table_id_ = table_schema->get_table_id();
+      state.request_id_ = ATOMIC_AAF(&g_ai_column_request_id, 1);
+      bool pk_changed = false;
+      if (2 == kind) {
+        const int64_t set_pos = ai_find_word(stmt, 0, "set");
+        if (-1 != set_pos) {
+          set_text = (-1 != where_pos)
+              ? ai_sub(stmt, static_cast<int32_t>(set_pos + 3),
+                       static_cast<int32_t>(where_pos - set_pos - 3))
+              : ai_sub(stmt, static_cast<int32_t>(set_pos + 3),
+                       stmt.length() - static_cast<int32_t>(set_pos + 3));
+          for (int64_t i = 0; OB_SUCC(ret) && !state.touched_ && i < state.ai_columns_.count();
+               ++i) {
+            if (ai_text_references(state.ai_columns_.at(i), set_text)) {
+              state.touched_ = true;
+            }
+          }
+          if (OB_SUCC(ret) && ai_set_touches_pk(*table_schema, set_text)) {
+            state.touched_ = true;
+            pk_changed = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && 1 == kind) {
+        // queue the rows this insert creates, straight from the VALUES text
+        if (values_pos > 0) {
+          for (int64_t i = 0; OB_SUCC(ret) && i < state.ai_columns_.count(); ++i) {
+            common::ObSqlString sql;
+            if (OB_FAIL(ai_build_insert_tasks(sql, *table_schema, state.ai_columns_.at(i),
+                                              state.table_id_, state.request_id_, stmt,
+                                              values_pos, db_name, table_name))) {
+            } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
+            }
+          }
+        }
+      } else if (OB_SUCC(ret) && 2 == kind && state.touched_) {
+        if (!where_text.empty()) {
+          common::ObSqlString sql;
+          if (OB_FAIL(ai_build_task_cleanup(sql, *table_schema, state.table_id_, db_name,
+                                            table_name, where_text))) {
+          } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
+          }
+        }
+        if (OB_SUCC(ret) && !where_text.empty()) {
+          common::ObSqlString sql;
+          if (OB_FAIL(ai_build_invalidate(sql, state.ai_columns_, db_name, table_name, where_text))) {
+          } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          for (int64_t i = 0; OB_SUCC(ret) && i < state.ai_columns_.count(); ++i) {
+            common::ObSqlString sql;
+            int tmp_ret = OB_SUCCESS;
+            if (pk_changed) {
+              tmp_ret = ai_build_task_insert_of_update(sql, *table_schema,
+                                                       state.ai_columns_.at(i), state.table_id_,
+                                                       state.request_id_, db_name, table_name,
+                                                       where_text, set_text);
+            } else {
+              tmp_ret = ai_build_task_insert(sql, *table_schema, state.ai_columns_.at(i),
+                                             state.table_id_, state.request_id_, db_name,
+                                             table_name, where_text);
+            }
+            if (OB_FAIL(tmp_ret)) {
+            } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
+            }
+          }
+        }
+      } else if (OB_SUCC(ret) && 3 == kind && !where_text.empty()) {
+        common::ObSqlString sql;
+        if (OB_FAIL(ai_build_task_cleanup(sql, *table_schema, state.table_id_, db_name,
+                                          table_name, where_text))) {
+        } else if (OB_FAIL(ai_store_stmt(state.alloc_, state.pre_stmts_, sql))) {
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_DEBUG("AICOL prepare skip", KR(ret));
+    state.reset();
+    ret = OB_SUCCESS;
+  } else if (!state.ai_columns_.empty()) {
+    LOG_INFO("AICOL prepare done", K(kind), K(table_name), "pre", state.pre_stmts_.count(),
+             K(state.touched_));
+    for (int64_t i = 0; i < state.pre_stmts_.count(); ++i) {
+      LOG_INFO("AICOL pre sql", K(i), K(state.pre_stmts_.at(i)));
+    }
+  }
+  return ret;
+}
+
+int ai_run(ObSQLSessionInfo &session, common::ObIArray<common::ObString> &stmts)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < stmts.count(); ++i) {
+    if (OB_FAIL(ai_exec(session, stmts.at(i)))) {
+      LOG_WARN("ai column side effect failed", KR(ret), K(stmts.at(i)));
+    }
+  }
+  return ret;
+}
+
+} // namespace ai_column_dml
+
 int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -184,8 +1292,12 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
            K(trunc_stmt));
 #endif
   NG_TRACE(parse_begin);
+  ai_column_dml::AiDmlState ai_dml_state;
   //1 check inited
   if (OB_FAIL(sanity_check(context))) {
+  } else if (FALSE_IT(ai_column_dml::ai_prepare(result.get_session(), stmt, ai_dml_state))) {
+  } else if (FALSE_IT(ai_column_dml::ai_run(result.get_session(),
+                                            ai_dml_state.pre_stmts_))) {
   } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
     if (OB_EAGAIN != ret) {
     }
