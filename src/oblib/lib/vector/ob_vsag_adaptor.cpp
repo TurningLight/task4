@@ -1311,20 +1311,6 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
     if (OB_FAIL(hnsw->add_index(incremental))) {
     }
   }
-    HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    // add index
-    DatasetPtr incremental = vsag::Dataset::Make();
-    incremental->Dim(dim)
-        ->NumElements(size)
-        ->Ids(ids)
-        ->Float32Vectors(vector)
-        ->Owner(false);
-    if (extra_info != nullptr) {
-      incremental->ExtraInfos(extra_info);
-    }
-    if (OB_FAIL(hnsw->add_index(incremental))) {
-    }
-  }
   return ret;
 }
 
