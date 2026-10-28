@@ -508,6 +508,27 @@ protected:
       bool is_resolve_for_alter_table);
   int resolve_column_name(common::ObString &col_name, ParseNode *node);
   int resolve_column_name(share::schema::ObColumnSchemaV2 &column, ParseNode *node);
+public:
+  // ---- AI COLUMN ----
+  // Resolve the optional `AI COLUMN ( expr ) [WITH (...)]` suffix of one column
+  // definition.  `column` is the AI column itself, its column id must be set.
+  // When `create_hidden_columns` is true the three hidden physical columns are
+  // materialized here (CREATE TABLE); otherwise the caller materializes them once
+  // the final column id is known (ALTER TABLE ADD COLUMN).
+  int resolve_ai_column_clause(const ParseNode &column_definition,
+                              const share::schema::ObColumnSchemaV2 &column,
+                              share::schema::ObTableSchema &table_schema,
+                              const bool create_hidden_columns,
+                              uint64_t &max_used_column_id);
+  // Append the three hidden physical columns of one AI column to `table_schema`
+  // and return their column ids.  `max_used_column_id` is updated in place.
+  static int create_ai_column_hidden_columns(const share::schema::ObAiColumnSchema &ai_column,
+                                             share::schema::ObTableSchema &table_schema,
+                                             uint64_t &max_used_column_id,
+                                             uint64_t &state_column_id,
+                                             uint64_t &request_column_id,
+                                             uint64_t &result_spec_column_id);
+protected:
   int resolve_column_definition(
       share::schema::ObColumnSchemaV2 &column,
       ParseNode *node,

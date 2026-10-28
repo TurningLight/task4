@@ -120,6 +120,12 @@ public:
                             const bool need_to_deal_with_cst_cols,
                             const bool do_cst_revise);
 
+  // AI COLUMN: append the row of one AI column to __all_ai_column (+ history)
+  int add_single_ai_column(common::ObISQLClient &sql_client,
+                           const ObTableSchema &table,
+                           const ObAiColumnSchema &ai_column);
+  int batch_add_ai_columns_for_create_table(common::ObISQLClient &sql_client,
+                                            const common::ObIArray<ObTableSchema> &tables);
   //alter table add column
   int insert_single_column(common::ObISQLClient &sql_client,
                            const ObTableSchema &new_table_schema,

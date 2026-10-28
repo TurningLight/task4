@@ -2276,6 +2276,9 @@ typedef enum ObItemType
   T_MERGE_TABLE = 4919,
   T_FILE_TABLE_EXPRESSION = 4921, // file_sql: read_csv/read_json/read_parquet/glob
   T_COPY_INTO = 4922, // file_sql: COPY (query) TO 'file' (options)
+  T_AI_COLUMN = 4923, // AI COLUMN ( expr ) [WITH (...)] column suffix, [expr, options]
+  T_AI_COLUMN_OPTIONS = 4924, // WITH (sync_mode='async', max_retries=N)
+  T_SHOW_AI_COLUMNS = 4925, // SHOW AI COLUMNS
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

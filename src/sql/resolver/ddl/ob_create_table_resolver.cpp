@@ -833,6 +833,12 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
               }
             }
           }
+          // AI COLUMN: validate the clause and materialize the hidden columns
+          if (OB_SUCC(ret) && OB_FAIL(resolve_ai_column_clause(*element, column, table_schema,
+                                                               true, cur_column_id_))) {
+            SQL_RESV_LOG(WARN, "failed to resolve AI COLUMN clause", K(ret),
+                         K(column.get_column_name_str()));
+          }
 
           if (OB_SUCC(ret) && !column.is_invisible_column()) {
             has_visible_col = true;
