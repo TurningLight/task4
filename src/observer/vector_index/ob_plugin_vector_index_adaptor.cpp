@@ -1361,6 +1361,20 @@ int ObPluginVectorIndexAdaptor::init_sparse_vector_type()
   return ret;
 }
 
+// [hipVS/cuVS] Mark a just-populated index handle for the GPU path when the
+// vector index was declared WITH (lib=cuvs) on a dense L2 HNSW index. Idempotent.
+static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
+{
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
+  if (handle != nullptr && param != nullptr
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
+    oceanbase::common::obvsag::mark_cuvs_index(handle);
+  }
+}
+
 int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                             const int64_t vid_idx,
                                             const int64_t type_idx,
@@ -1523,6 +1537,7 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                               ))) {
         }
       } else {
+        ob_mark_cuvs_if_needed(algo_data_, incr_data_->index_);
         if (OB_FAIL(obvectorutil::add_index(incr_data_->index_,
                                               vectors,
                                               incr_vids,
@@ -1714,6 +1729,7 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
           if (!is_sparse_vector_index_type()) {
+            ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
             if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
             }
           } else {
@@ -3168,12 +3184,17 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  const ObVectorIndexParam *ser_param = static_cast<const ObVectorIndexParam *>(algo_data_);
+  const bool gpu_only_snapshot = ser_param != nullptr
+      && ser_param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS;
   if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(obvectorutil::get_index_number(snap_data_->index_, snap_index_size))) {
-  } else if (snap_index_size == 0) {
-    // do nothing
-    LOG_INFO("[vec index] empty snap index, do not need to serialize");
+  } else if (snap_index_size == 0 || gpu_only_snapshot) {
+    // do nothing: a lib=cuvs index lives on the GPU and keeps no VSAG snapshot
+    // to persist; CAGRA is rebuilt process-locally on demand.
+    LOG_INFO("[vec index] empty snap index or lib=cuvs, do not need to serialize",
+             K(snap_index_size), K(gpu_only_snapshot));
   } else if (OB_FAIL(index_seri.serialize(snap_data_->index_, cb_param, cb))) {
   } else {
     // for multi-version snapshot
