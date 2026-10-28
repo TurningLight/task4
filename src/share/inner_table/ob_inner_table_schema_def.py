@@ -2485,8 +2485,9 @@ all_ai_column_task_def = dict(
     normal_columns = [
         ('request_id', 'varchar:128', 'false'),
         ('ai_column_id', 'int', 'false'),
-        ('row_key', 'varchar:1024', 'true'),
-        ('task_state', 'varchar:32', 'false'),
+        ('rowkey_predicate', 'varchar:1024', 'true'),
+        ('eligible_ts', 'timestamp', 'true'),
+        ('state', 'varchar:32', 'false'),
         ('retry_count', 'int'),
         ('result_spec', 'varchar:4096', 'true')
   ]
