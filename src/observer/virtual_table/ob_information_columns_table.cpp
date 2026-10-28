@@ -17,6 +17,7 @@
 
 #include "observer/ob_server_runtime_access.h"
 #include "observer/virtual_table/ob_information_columns_table.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "observer/virtual_table/ob_table_columns.h"
 #include "share/geo/ob_geo_utils.h"
 #include "share/ob_lob_access_utils.h"
@@ -311,6 +312,10 @@ int ObInfoSchemaColumnsTable::iterate_column_schema_array(
     } else {
       // Do not display hidden pk
       if (column_schema->is_hidden()) {
+        continue;
+      }
+      // Do not display the internal state columns of an AI column
+      if (share::schema::ai_column::is_ai_state_column(*column_schema)) {
         continue;
       }
       // use const_column_iterator, if it's index table

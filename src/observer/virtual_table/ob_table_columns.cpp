@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SERVER
 #include "observer/virtual_table/ob_table_columns.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "observer/ob_server_runtime_access.h"
 #include "sql/resolver/ddl/ob_create_view_resolver.h"
 using namespace oceanbase::common;
@@ -231,6 +232,8 @@ int ObTableColumns::inner_get_next_row(ObNewRow *&row)
               ret = OB_ERR_UNEXPECTED;
             } else if (table_schema->is_heap_organized_table() && col->is_hidden_pk_column_id(col->get_column_id())) {
               // heap organized table should not output hidden pk columns
+            } else if (share::schema::ai_column::is_ai_state_column(*col)) {
+              // the internal state columns of an AI column are not shown to users
             } else if (OB_FAIL(fill_row_cells(*table_schema, *col, has_column_priv))) {
             } else if (is_column_level && !has_column_priv) {
               //do not output the column

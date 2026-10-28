@@ -16,6 +16,9 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "query/session/ob_session_inner_sql.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -136,6 +139,139 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   }
   return ret;
 }
+
+
+namespace
+{
+
+// ai_column_strict_read = ON: a statement that reads an AI column must not silently get
+// NULL for rows whose derived value is not ready yet, it fails instead.  The check is done
+// per column: as long as one row of a referenced AI column is PENDING or FAILED, the whole
+// statement is rejected.
+//
+// The derivation state lives in the state columns of the same table, so the check is a
+// single existence query per referenced AI column and sees exactly the rows this session
+// is allowed to read.
+int check_ai_column_strict_read(ObResolverParams &params, ObDMLStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  ObSQLSessionInfo *session_info = params.session_info_;
+  ObSchemaChecker *schema_checker = params.schema_checker_;
+  ObSEArray<ObString, 8> db_names;
+  ObSEArray<ObString, 8> table_names;
+  ObSEArray<ObString, 8> column_names;
+  if (OB_ISNULL(session_info) || OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (session_info->is_inner()) {
+    // internal SQL keeps the lenient behaviour
+  } else if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                    strict_read))) {
+    // the switch is not available in this context (e.g. during bootstrap): keep the
+    // default, lenient behaviour
+    LOG_WARN("failed to read ai_column_strict_read, disable the strict read check", K(ret));
+    ret = OB_SUCCESS;
+  } else if (!strict_read) {
+    // nothing to do
+  } else if (!stmt.is_select_stmt()) {
+    // only statements that read an AI column are checked; a DML statement carries the whole
+    // row in its column items, so checking it here would reject unrelated writes
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt.get_table_size(); ++i) {
+      TableItem *table_item = stmt.get_table_item(i);
+      const ObTableSchema *table_schema = NULL;
+      if (OB_ISNULL(table_item)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!table_item->is_basic_table()) {
+        // views, temporary tables and generated tables are checked through their base tables
+      } else if (OB_FAIL(schema_checker->get_table_schema(table_item->ref_id_, table_schema))) {
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!share::schema::ai_column::table_has_ai_column(*table_schema)) {
+        // the table has no AI column
+      } else {
+        for (int64_t j = 0; OB_SUCC(ret) && j < stmt.get_column_size(); ++j) {
+          ColumnItem *column_item = stmt.get_column_item(j);
+          const ObColumnSchemaV2 *column_schema = NULL;
+          if (OB_ISNULL(column_item)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (column_item->table_id_ != table_item->table_id_) {
+            // a column of another table
+          } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(
+                                 column_item->column_id_))) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (!share::schema::ai_column::is_ai_column(*column_schema)) {
+            // a regular column
+          } else {
+            bool duplicated = false;
+            for (int64_t k = 0; !duplicated && k < column_names.count(); ++k) {
+              duplicated = (0 == column_names.at(k).compare(column_schema->get_column_name_str()));
+            }
+            if (duplicated) {
+              // already checked
+            } else if (OB_FAIL(db_names.push_back(table_item->get_object_db_name()))) {
+            } else if (OB_FAIL(table_names.push_back(table_schema->get_table_name_str()))) {
+            } else if (OB_FAIL(column_names.push_back(column_schema->get_column_name_str()))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
+    char done_name[OB_MAX_COLUMN_NAME_LENGTH];
+    char chk_name[OB_MAX_COLUMN_NAME_LENGTH];
+    const char *done_prefix = share::schema::ai_column::AI_DONE_PREFIX;
+    const char *chk_prefix = share::schema::ai_column::AI_CHK_PREFIX;
+    const int64_t name_len = column_names.at(i).length();
+    const int64_t done_prefix_len = static_cast<int64_t>(strlen(done_prefix));
+    const int64_t chk_prefix_len = static_cast<int64_t>(strlen(chk_prefix));
+    ObSqlString query;
+    if (OB_UNLIKELY(done_prefix_len + name_len > OB_MAX_COLUMN_NAME_LENGTH
+                    || chk_prefix_len + name_len > OB_MAX_COLUMN_NAME_LENGTH)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      MEMCPY(done_name, done_prefix, done_prefix_len);
+      MEMCPY(done_name + done_prefix_len, column_names.at(i).ptr(), name_len);
+      MEMCPY(chk_name, chk_prefix, chk_prefix_len);
+      MEMCPY(chk_name + chk_prefix_len, column_names.at(i).ptr(), name_len);
+      if (OB_FAIL(query.append_fmt(
+              "select 1 from `%.*s`.`%.*s` where `%.*s` is null or `%.*s` <> `%.*s` limit 1",
+              db_names.at(i).length(), db_names.at(i).ptr(),
+              table_names.at(i).length(), table_names.at(i).ptr(),
+              static_cast<int>(done_prefix_len + name_len), done_name,
+              static_cast<int>(done_prefix_len + name_len), done_name,
+              static_cast<int>(chk_prefix_len + name_len), chk_name))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      query::ObSessionInnerSql session_io(session_info);
+      SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+        int next_ret = OB_SUCCESS;
+        if (OB_FAIL(session_io.execute_read(query, result))) {
+        } else if (OB_ISNULL(result.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_SUCCESS == (next_ret = result.get_result()->next())) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "reading an AI column that still has rows waiting for their value "
+                         "(ai_column_strict_read)");
+          LOG_WARN("strict read of an AI column is blocked", K(ret),
+                   K(db_names.at(i)), K(table_names.at(i)), K(column_names.at(i)));
+        } else if (OB_ITER_END == next_ret) {
+          ret = OB_SUCCESS;
+        } else {
+          ret = next_ret;
+          LOG_WARN("failed to check the readiness of an AI column", K(ret),
+                   K(query), K(db_names.at(i)), K(table_names.at(i)));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // anonymous namespace
 
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
@@ -631,6 +767,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
     }  // end switch
+    // ai_column_strict_read: reject the statement before it runs if a referenced AI column
+    // still has rows whose derived value is not ready
+    if (OB_SUCC(ret) && !stmt->is_explain_stmt() && stmt->is_dml_stmt()
+        && OB_FAIL(check_ai_column_strict_read(params_, *static_cast<ObDMLStmt *>(stmt)))) {
+    }
     if (OB_SUCC(ret) && stmt->is_dml_write_stmt()) {
       // todo yanli:check leader-follower database
     }

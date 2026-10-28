@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_insert_resolver.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "ob_default_value_utils.h"
@@ -98,6 +99,33 @@ int ObInsertResolver::resolve(const ParseNode &parse_tree)
 
   if (OB_SUCC(ret)) {
     if (OB_FAIL(check_view_insertable())) {
+    }
+  }
+
+  // The value of an AI column is produced asynchronously by the system, so the column must
+  // not appear in the insert column list.  The check is ancillary: a schema lookup that does
+  // not succeed simply disables it.
+  if (OB_SUCC(ret) && NULL != insert_stmt) {
+    const TableItem *insert_table_item = insert_stmt->get_table_item_by_id(
+        insert_stmt->get_insert_table_info().table_id_);
+    const ObTableSchema *table_schema = NULL;
+    if (OB_NOT_NULL(insert_table_item)
+        && OB_SUCCESS == schema_checker_->get_table_schema(insert_table_item->ref_id_, table_schema)
+        && OB_NOT_NULL(table_schema)) {
+      const ObIArray<ObColumnRefRawExpr *> &value_desc = insert_stmt->get_values_desc();
+      for (int64_t i = 0; OB_SUCC(ret) && i < value_desc.count(); ++i) {
+        const ObColumnSchemaV2 *column_schema = NULL;
+        if (OB_ISNULL(value_desc.at(i))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(
+                               value_desc.at(i)->get_column_id()))) {
+          // a generated table column, nothing to check here
+        } else if (share::schema::ai_column::is_ai_column(*column_schema)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI column, its value is derived by the system");
+          LOG_WARN("try to insert into an AI column", K(ret), KPC(column_schema));
+        }
+      }
     }
   }
 

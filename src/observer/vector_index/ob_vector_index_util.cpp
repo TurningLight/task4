@@ -20,6 +20,7 @@
 #include <string>
 
 #include "ob_vector_index_util.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "share/rc/ob_server_runtime.h"
 #include "observer/vector_index/ob_vector_index_sched_job_utils.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
@@ -1693,13 +1694,28 @@ int ObVectorIndexUtil::get_vector_dim_from_extend_type_info(const ObIArray<ObStr
 {
   int ret = OB_SUCCESS;
   dim = 0;
-  if (extend_type_info.count() != 1) {
+  // An AI vector column keeps the description of its derivation in the same array, so only
+  // the entries that describe the type of the column participate here.
+  int64_t type_info_cnt = 0;
+  const ObString *type_info = NULL;
+  for (int64_t i = 0; i < extend_type_info.count(); ++i) {
+    if (share::schema::ai_column::starts_with(extend_type_info.at(i),
+                                              share::schema::ai_column::AI_META_MAGIC)) {
+      // not a type description
+    } else {
+      ++type_info_cnt;
+      if (NULL == type_info) {
+        type_info = &extend_type_info.at(i);
+      }
+    }
+  }
+  if (1 != type_info_cnt || NULL == type_info) {
     // Vector index columns currently only support single column vector indexes.
     // When building the vector column of the auxiliary table, only one column of extend_type_info is assigned.
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "vector column index only support build on one vector column");
   } else {
-    ObString extend_type_info_str = extend_type_info.at(0);
+    ObString extend_type_info_str = *type_info;
     ObString spilt_str = extend_type_info_str.split_on('(').trim();
     if (0 == spilt_str.compare("ARRAY") || 0 == spilt_str.compare("MAP")) {
       ret = OB_NOT_SUPPORTED;
@@ -1724,14 +1740,26 @@ int ObVectorIndexUtil::get_vector_dim_from_extend_type_info(const ObIArray<ObStr
   int ret = OB_SUCCESS;
   is_sparse_vec_col = false;
 
-  if (extend_type_info.count() != 1) {
+  int64_t type_info_cnt = 0;
+  const ObString *type_info = NULL;
+  for (int64_t i = 0; i < extend_type_info.count(); ++i) {
+    if (share::schema::ai_column::starts_with(extend_type_info.at(i),
+                                              share::schema::ai_column::AI_META_MAGIC)) {
+      // an AI vector column keeps its derivation description next to its type description
+    } else {
+      ++type_info_cnt;
+      if (NULL == type_info) {
+        type_info = &extend_type_info.at(i);
+      }
+    }
+  }
+  if (1 != type_info_cnt || NULL == type_info) {
     // sparse vector index columns currently only support single column vector indexes.
     // When building the vector column of the auxiliary table, only one column of extend_type_info is assigned.
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vector index on more than one column is");
   } else {
-    ObString str = extend_type_info.at(0);
-    is_sparse_vec_col = (0 == str.compare("SPARSEVECTOR"));
+    is_sparse_vec_col = (0 == type_info->compare("SPARSEVECTOR"));
   }
 
   return ret;

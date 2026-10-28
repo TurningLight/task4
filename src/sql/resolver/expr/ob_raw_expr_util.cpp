@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 
 #include "ob_raw_expr_util.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "sql/parser/ob_sql_parser.h"
 #include "sql/engine/expr/ob_expr_to_type.h"
@@ -4872,10 +4873,24 @@ int ObRawExprUtils::init_column_expr_subschema(const share::schema::ObColumnSche
     }
   } else if (column_schema.is_collection()) {
     uint16_t subschema_id = 0;
-    if (OB_UNLIKELY(column_schema.get_extended_type_info().count() != 1)) {
+    // An AI vector column keeps the description of its derivation in the same array, only the
+    // entry that describes the type takes part in the subschema id.
+    const ObString *type_info = NULL;
+    int64_t type_info_cnt = 0;
+    for (int64_t i = 0; i < column_schema.get_extended_type_info().count(); ++i) {
+      if (share::schema::ai_column::starts_with(column_schema.get_extended_type_info().at(i),
+                                                share::schema::ai_column::AI_META_MAGIC)) {
+        // not a type description
+      } else {
+        ++type_info_cnt;
+        if (NULL == type_info) {
+          type_info = &column_schema.get_extended_type_info().at(i);
+        }
+      }
+    }
+    if (OB_UNLIKELY(1 != type_info_cnt || NULL == type_info)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(
-                                  column_schema.get_extended_type_info().at(0), subschema_id))) {
+    } else if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(*type_info, subschema_id))) {
     } else {
       column_expr.set_subschema_id(subschema_id);
     }
