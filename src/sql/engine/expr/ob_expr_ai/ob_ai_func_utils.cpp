@@ -15,7 +15,6 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "sql/ob_ai_column_worker_env.h"
 #include "ob_ai_func_utils.h"
 #include "ob_ai_func_client.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
@@ -1398,11 +1397,6 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   ObString prompt_str;
   ObString result_str;
   ObAIFuncClient client;
-  if (::oceanbase::sql::ObAiColumnWorkerEnv::is_active()) {
-    // queued AI COLUMN work carries the type hint of the column's normalized
-    // expression; it is the system message of the completion request
-    prompt_str = ::oceanbase::sql::ObAiColumnWorkerEnv::get_system_prompt();
-  }
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
   if (!is_completion_type()) {

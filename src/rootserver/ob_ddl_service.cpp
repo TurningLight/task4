@@ -7825,52 +7825,7 @@ int ObDDLService::add_new_column_to_table_schema(
     } else {
       alter_column_schema.set_prev_column_id(mem_col->get_prev_column_id());
       if (update_inner_table) {
-        // AI COLUMN: materialize the three hidden physical columns of this AI
-        // column now that the final column id is known.
-        const ObAiColumnSchema *ai_column_schema = NULL;
-        const ObAiColumnSchema *already_materialized = NULL;
-        uint64_t ai_state_column_id = OB_INVALID_ID;
-        uint64_t ai_request_column_id = OB_INVALID_ID;
-        uint64_t ai_result_spec_column_id = OB_INVALID_ID;
-        if (OB_FAIL(alter_table_schema.get_ai_column_schema_by_column_name(
-                      alter_column_schema.get_column_name_str(), ai_column_schema))) {
-        } else if (OB_ISNULL(ai_column_schema)) {
-          // ordinary column
-        } else if (OB_FAIL(new_table_schema.get_ai_column_schema_by_column_id(
-                      alter_column_schema.get_column_id(), already_materialized))) {
-        } else if (OB_NOT_NULL(already_materialized)) {
-          // already materialized
-        } else {
-          uint64_t next_column_id = new_table_schema.get_max_used_column_id();
-          ObAiColumnSchema final_ai_column;
-          if (OB_FAIL(ObDDLResolver::create_ai_column_hidden_columns(
-                        *ai_column_schema, new_table_schema, next_column_id,
-                        ai_state_column_id, ai_request_column_id,
-                        ai_result_spec_column_id))) {
-          } else if (OB_FAIL(final_ai_column.assign(*ai_column_schema))) {
-          } else {
-            final_ai_column.set_table_id(new_table_schema.get_table_id());
-            final_ai_column.set_column_id(alter_column_schema.get_column_id());
-            final_ai_column.set_state_column_id(ai_state_column_id);
-            final_ai_column.set_request_column_id(ai_request_column_id);
-            final_ai_column.set_result_spec_column_id(ai_result_spec_column_id);
-            if (OB_FAIL(new_table_schema.add_ai_column_schema(final_ai_column))) {
-            }
-          }
-          const uint64_t hidden_ids[3] = { ai_state_column_id, ai_request_column_id,
-                                          ai_result_spec_column_id };
-          for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
-            const ObColumnSchemaV2 *hidden_column = NULL;
-            if (OB_ISNULL(hidden_column = new_table_schema.get_column_schema(hidden_ids[i]))) {
-              ret = OB_ERR_UNEXPECTED;
-            } else if (OB_FAIL(ddl_operator->insert_single_column(
-                           *trans, new_table_schema,
-                           *const_cast<ObColumnSchemaV2 *>(hidden_column)))) {
-            }
-          }
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(ddl_operator->insert_single_column(*trans,
+        if (OB_FAIL(ddl_operator->insert_single_column(*trans,
                 new_table_schema, alter_column_schema))) {
         }
       }

@@ -2467,69 +2467,6 @@ all_objauth_mysql_def = dict(
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
 
-# ---- AI COLUMN: physical metadata of every AI column -------------------------
-# One row per AI column; the three *_column_id columns point at the hidden
-# physical columns of that AI column (state / request / result_spec).
-all_ai_column_def = dict(
-    owner = 'iamSttt',
-    table_name = '__all_ai_column',
-    table_id = '1135',
-    table_type = 'SYSTEM_TABLE',
-    gm_columns = ['gmt_create', 'gmt_modified'],
-    rowkey_columns = [
-      ('table_id', 'int'),
-      ('column_id', 'int')
-  ],
-
-    is_cluster_private = False,
-    meta_record_in_sys = False,
-    normal_columns = [
-        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
-        ('max_retries', 'int', 'false', '0'),
-        ('sync_mode', 'varchar:32'),
-        ('normalized_expr', 'longtext', 'true'),
-        ('state_column_id', 'int', 'false', '-1'),
-        ('request_column_id', 'int', 'false', '-1'),
-        ('result_spec_column_id', 'int', 'false', '-1')
-  ]
-)
-
-def_table_schema(**all_ai_column_def)
-def_table_schema(**gen_history_table_def(1136, all_ai_column_def))
-
-# ---- AI COLUMN: async execution queue ----------------------------------------
-# One row per (row, statement, ai column) that still needs a model call.
-# request_id groups every AI column of one row touched by one statement, so a
-# row with two AI columns produces count(*)=2 and count(distinct request_id)=1.
-all_ai_column_task_def = dict(
-    owner = 'iamSttt',
-    table_name = '__all_ai_column_task',
-    table_id = '1137',
-    table_type = 'SYSTEM_TABLE',
-    gm_columns = ['gmt_create', 'gmt_modified'],
-    rowkey_columns = [
-      ('table_id', 'int'),
-      ('request_id', 'int'),
-      ('column_id', 'int')
-  ],
-
-    is_cluster_private = False,
-    meta_record_in_sys = False,
-    normal_columns = [
-        ('state', 'int', 'false', '0'),
-        ('retry_count', 'int', 'false', '0'),
-        ('eligible_ts', 'timestamp:6', 'true'),
-        ('rowkey_predicate', 'longtext', 'true'),
-        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'true'),
-        ('ai_expr', 'longtext', 'true'),
-        ('max_retries', 'int', 'false', '0'),
-        ('target_type', 'int', 'false', '0')
-  ]
-)
-
-def_table_schema(**all_ai_column_task_def)
-def_table_schema(**gen_history_table_def(1138, all_ai_column_task_def))
-
 
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use actual table names for placeholders

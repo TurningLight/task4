@@ -41,7 +41,6 @@
 #endif
 #include "share/ob_define.h"
 #include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_ai_column_schema.h"
 #include "share/schema/ob_trigger_info.h"
 #include "lib/compress/ob_compress_util.h"
 namespace oceanbase
@@ -1055,20 +1054,6 @@ public:
   inline void set_dop(int64_t table_dop) { table_dop_ = table_dop; }
   template<typename ColumnType>
   int add_column(const ColumnType &column);
-  // ---- AI column metadata (see share/schema/ob_ai_column_schema.h) ----
-  int add_ai_column_schema(const ObAiColumnSchema &ai_column_schema);
-  const common::ObSEArray<ObAiColumnSchema, 1> &get_ai_column_schemas() const
-  {
-    return ai_column_schemas_;
-  }
-  common::ObSEArray<ObAiColumnSchema, 1> &get_ai_column_schemas() { return ai_column_schemas_; }
-  int get_ai_column_schema_by_column_id(const uint64_t column_id,
-                                        const ObAiColumnSchema *&ai_column_schema) const;
-  int get_ai_column_schema_by_column_name(const common::ObString &column_name,
-                                          const ObAiColumnSchema *&ai_column_schema) const;
-  // Rebuild ai_column_schemas_ from the hidden physical columns of this table.
-  // Idempotent: columns whose AI metadata is already registered are skipped.
-  int rebuild_ai_column_schemas();
   int delete_column(const common::ObString &column_name);
   int delete_all_view_columns();
   int alter_column(ObColumnSchemaV2 &column, ObColumnCheckMode check_mode, const bool for_view);
@@ -1671,9 +1656,6 @@ protected:
   // exec_env
   common::ObString exec_env_;
   ObSemiStructEncodingType semistruct_encoding_type_;
-
-  // AI columns defined on this table
-  common::ObSEArray<ObAiColumnSchema, 1> ai_column_schemas_;
 };
 
 class ObPrintableTableSchema final : public ObTableSchema

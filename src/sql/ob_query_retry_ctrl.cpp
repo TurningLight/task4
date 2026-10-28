@@ -499,12 +499,7 @@ private:
   bool is_nested_conn(ObRetryParam &v) const
   {
     ObExecContext *parent_ctx = v.session_.get_cur_exec_ctx();
-    // The AI COLUMN DML hook runs its side statements from the pre phase of
-    // ObSql::stmt_query, where the current exec context is already linked to
-    // the session but its sql context is not published yet. Guard the access
-    // instead of dereferencing a null sql context.
     bool is_pl_nested = (parent_ctx != nullptr
-                         && parent_ctx->get_sql_ctx() != nullptr
                          && ObStmt::is_dml_stmt(parent_ctx->get_sql_ctx()->stmt_type_)
                          && parent_ctx->get_pl_stack_ctx() != nullptr);
     bool is_fk_nested = (parent_ctx != nullptr && parent_ctx->get_das_ctx().is_fk_cascading_);
