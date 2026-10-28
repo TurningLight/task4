@@ -437,6 +437,8 @@ int ObTableUpdateOp::write_rows_post_proc(int last_errno)
       if (OB_FAIL(check_update_affected_row())) {
       }
     }
+    if (OB_SUCC(ret) && OB_FAIL(AiColumnHandle::execute_pending_invalidations(*this))) {
+    }
   }
 
   return ret;

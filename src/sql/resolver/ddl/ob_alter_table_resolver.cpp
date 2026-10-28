@@ -582,6 +582,11 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             }
             break;
         }
+        case T_RETRY_AI_COLUMN: {
+            if (OB_FAIL(resolve_retry_ai_column(*action_node, *alter_table_stmt))) {
+            }
+            break;
+          }
         case T_MODIFY_ALL_TRIGGERS: {
             alter_table_stmt->set_is_alter_triggers(true);
             if (OB_FAIL(resolve_modify_all_trigger(*action_node))) {
@@ -596,6 +601,11 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
           }
         }
       }
+    }
+    if (OB_SUCC(ret) && alter_table_stmt->get_alter_table_arg().is_retry_ai_column_
+        && alter_table_stmt->get_alter_table_action_count() > 1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(check_skip_index(alter_table_stmt->get_alter_table_arg().alter_table_schema_))) {
@@ -746,6 +756,39 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
     }
     } // end for heap_vars_2.
   }
+  return ret;
+}
+
+
+int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node,
+                                                  ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  obcall::ObAlterTableArg &arg = stmt.get_alter_table_arg();
+  ParseNode *name_node = node.num_child_ > 0 ? node.children_[0] : nullptr;
+  ParseNode *where_node = node.num_child_ > 1 ? node.children_[1] : nullptr;
+  const ObColumnSchemaV2 *column_schema = nullptr;
+  if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_)
+      || OB_ISNULL(table_schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObString column_name(name_node->str_len_, name_node->str_value_);
+    if (OB_ISNULL(column_schema = table_schema_->get_column_schema(column_name))
+        || !column_schema->is_ai_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    } else if (OB_FAIL(ob_write_string(arg.allocator_, column_name,
+                                       arg.retry_ai_column_name_))) {
+    } else if (OB_NOT_NULL(where_node) && node.str_len_ > 0
+               && OB_FAIL(ob_write_string(arg.allocator_,
+                          ObString(node.str_len_, node.str_value_),
+                          arg.retry_ai_column_where_))) {
+    } else {
+      arg.is_retry_ai_column_ = true;
+      arg.table_id_ = table_schema_->get_table_id();
+    }
+  }
+  UNUSED(stmt);
   return ret;
 }
 

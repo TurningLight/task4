@@ -371,6 +371,12 @@ public:
   bool get_is_use_auto_dop() const { return stat_.is_use_auto_dop_; }
   bool px_worker_share_plan_enabled() const { return px_worker_share_plan_enabled_; }
   void set_px_worker_share_plan_enabled(bool v) { px_worker_share_plan_enabled_ = v; }
+  int set_ai_column_refs(const common::ObIArray<uint64_t> &table_ids,
+                         const common::ObIArray<uint64_t> &column_ids);
+  const common::ObIArray<uint64_t> &get_ai_column_ref_table_ids() const
+  { return ai_column_ref_table_ids_; }
+  const common::ObIArray<uint64_t> &get_ai_column_ref_column_ids() const
+  { return ai_column_ref_column_ids_; }
 
 public:
   static const int64_t MAX_PRINTABLE_SIZE = 2 * 1024 * 1024;
@@ -528,6 +534,9 @@ private:
 private:
   bool insertup_can_do_gts_opt_;
   int64_t px_worker_share_plan_enabled_;
+  // AI columns referenced by the statement, used by ai_column_strict_read.
+  common::ObSEArray<uint64_t, 4> ai_column_ref_table_ids_;
+  common::ObSEArray<uint64_t, 4> ai_column_ref_column_ids_;
 };
 
 inline void ObPhysicalPlan::set_affected_last_insert_id(bool affected_last_insert_id)

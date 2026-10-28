@@ -8154,9 +8154,18 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column, ParseNo
       if (OB_SUCC(ret)) {
         column.set_ai_max_retries(max_retries);
         ObSqlString buf;
+        const ObObjType ai_type = column.get_data_type();
+        const char *type_prompt = NULL;
+        if (ob_is_json_tc(ai_type)) {
+          type_prompt = " Return exactly one valid JSON value";
+        } else if (ob_is_integer_type(ai_type)) {
+          type_prompt = " Return exactly one base-10 integer";
+        } else if (ob_is_float_tc(ai_type) || ob_is_double_tc(ai_type)
+                   || ob_is_number_tc(ai_type)) {
+          type_prompt = " Return exactly one number";
+        }
         if (OB_FAIL(buf.append_fmt("%.*s", static_cast<int32_t>(expr->str_len_), expr->str_value_))) {
-        } else if (ob_is_json_tc(column.get_data_type())
-                   && OB_FAIL(buf.append(" Return exactly one valid JSON value"))) {
+        } else if (NULL != type_prompt && OB_FAIL(buf.append(type_prompt))) {
         } else if (OB_FAIL(column.set_ai_normalized_expr(buf.string()))) {
         }
       }

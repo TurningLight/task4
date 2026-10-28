@@ -48,6 +48,7 @@ private:
   ObExecutor &operator=(const ObExecutor &ohter);
 private:
   int execute_static_cg_px_plan(ObExecContext &ctx);
+  int check_ai_column_strict_read(ObExecContext &ctx);
 private:
   bool inited_;
   ObPhysicalPlan *phy_plan_;

@@ -125,8 +125,12 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline void set_autoincrement(const bool is_autoincrement) { is_autoincrement_ = is_autoincrement; }
   inline void set_is_hidden(const bool is_hidden) { is_hidden_ = is_hidden; }
   // ---- AI column metadata (competition) ----
-  inline void set_is_ai_column(const bool v) { is_ai_column_ = v; }
-  inline bool is_ai_column() const { return is_ai_column_; }
+  inline void set_is_ai_column(const bool v)
+  {
+    is_ai_column_ = v;
+    add_or_del_column_flag(AI_COLUMN_FLAG, v);
+  }
+  inline bool is_ai_column() const { return is_ai_column_ || (column_flags_ & AI_COLUMN_FLAG); }
   inline void set_ai_max_retries(const int32_t v) { ai_max_retries_ = v; }
   inline int32_t get_ai_max_retries() const { return ai_max_retries_; }
   inline void set_ai_state_column_id(const uint64_t v) { ai_state_column_id_ = v; }

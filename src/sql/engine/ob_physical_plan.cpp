@@ -205,6 +205,18 @@ void ObPhysicalPlan::destroy()
 }
 
 
+int ObPhysicalPlan::set_ai_column_refs(const common::ObIArray<uint64_t> &table_ids,
+                                       const common::ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  if (table_ids.count() != column_ids.count()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ai_column_ref_table_ids_.assign(table_ids))) {
+  } else if (OB_FAIL(ai_column_ref_column_ids_.assign(column_ids))) {
+  }
+  return ret;
+}
+
 int ObPhysicalPlan::set_vars(const common::ObIArray<ObVarInfo> &vars)
 {
   int ret = OB_SUCCESS;
@@ -649,7 +661,9 @@ OB_SERIALIZE_MEMBER(ObPhysicalPlan,
                     need_switch_to_table_lock_worker_,
                     data_complement_gen_doc_id_,
                     px_parallel_rule_,
-                    px_worker_share_plan_enabled_);
+                    px_worker_share_plan_enabled_,
+                    ai_column_ref_table_ids_,
+                    ai_column_ref_column_ids_);
 
 int ObPhysicalPlan::set_table_locations(const ObTablePartitionInfoArray &infos,
                                         ObSchemaGetterGuard &schema_guard)

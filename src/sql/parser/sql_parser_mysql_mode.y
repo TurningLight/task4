@@ -373,7 +373,6 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p opt_ai_column_with_options ai_column_option_list ai_column_option
-%type <node> opt_ai_column_clause
 %type <node> select_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
@@ -4837,28 +4836,14 @@ SIMPLE { $$[0] = T_SIMPLE; }
 | PARTIAL { $$[0] = T_PARTIAL; }
 ;
 
-opt_ai_column_clause:
-/*EMPTY*/
-{
-  $$ = NULL;
-}
-| AI COLUMN '(' expr ')' opt_ai_column_with_options
-{
-  dup_expr_string($4, result, @4.first_column, @4.last_column);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ATTR, 2, $4, $6);
-}
-;
-
 column_definition:
-column_definition_ref data_type opt_column_attribute_list opt_ai_column_clause opt_column_reference opt_position_column
+column_definition_ref data_type opt_column_attribute_list opt_column_reference opt_position_column
 {
-  (void)($5);
-  (void)($6);
+  (void)($4);
   ParseNode *attributes = NULL;
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $3);
-  merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $4);
   set_data_type_collation($2, attributes, false, true);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $6);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $5);
 }
 | column_definition_ref data_type opt_collation opt_generated_keyname AS '(' expr ')' opt_storage_type opt_generated_column_attribute_list opt_column_reference opt_position_column
 {
@@ -6159,7 +6144,12 @@ column_attribute_list column_attribute
 }
 
 column_attribute:
-not NULLX
+AI COLUMN '(' expr ')' opt_ai_column_with_options
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ATTR, 2, $4, $6);
+}
+| not NULLX
 {
   (void)($1) ;
   (void)($2) ; /* make bison mute */
@@ -14808,7 +14798,22 @@ alter_table_action
 ;
 
 alter_table_action:
-opt_set table_option_list_space_seperated
+NAME_OB AI COLUMN column_name opt_where
+{
+  if (NULL == $1 || 5 != $1->str_len_
+      || 0 != strncasecmp($1->str_value_, "retry", 5)) {
+    yyerror(&@1, result, "expected RETRY keyword");
+  } else {
+    ParseNode *retry_node = NULL;
+    malloc_non_terminal_node(retry_node, result->malloc_pool_,
+                             T_RETRY_AI_COLUMN, 2, $4, $5);
+    if (NULL != $5) {
+      dup_expr_string(retry_node, result, @5.first_column, @5.last_column);
+    }
+    $$ = retry_node;
+  }
+}
+| opt_set table_option_list_space_seperated
 {
   (void)$1;
   merge_nodes($$, result, T_TABLE_OPTION_LIST, $2);
