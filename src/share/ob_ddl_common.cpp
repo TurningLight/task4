@@ -31,12 +31,59 @@
 #include "common/object/ob_object.h"
 #include "share/tablet/ob_tablet_table_operator.h"
 #include "share/storage/ob_tablet_local_checksum_table_storage.h"
-#include "sql/ob_sql_utils.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::blocksstable;
+
+namespace
+{
+int escape_ddl_identifier(oceanbase::common::ObIAllocator &allocator,
+                          const oceanbase::common::ObString &src,
+                          oceanbase::common::ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  const ObString::obstr_size_t src_len = src.length();
+  ObString::obstr_size_t dst_len = src_len;
+  const char escape_character = '`';
+  char *ptr = NULL;
+
+  if (OB_ISNULL(src.ptr()) || OB_UNLIKELY(0 >= src_len)) {
+    dst.assign(NULL, 0);
+  } else if (NULL == src.find(escape_character)) {
+    dst = src;
+  } else {
+    for (int64_t i = 0; i < src_len; ++i) {
+      if (src[i] == escape_character) {
+        ++dst_len;
+      }
+    }
+    if (NULL == (ptr = static_cast<char *>(allocator.alloc(dst_len + 1)))) {
+      dst = NULL;
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_ERROR("allocate memory failed", K(ret), "size", dst_len);
+    } else {
+      int64_t tmp_dst_pos = 0;
+      for (int64_t i = 0; i < src_len; i++) {
+        if (src[i] == escape_character) {
+          ptr[tmp_dst_pos++] = escape_character;
+          ptr[tmp_dst_pos++] = escape_character;
+        } else {
+          ptr[tmp_dst_pos++] = src[i];
+        }
+      }
+      if (tmp_dst_pos != dst_len) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ptr[dst_len] = '\0';
+        dst.assign_ptr(ptr, dst_len);
+      }
+    }
+  }
+  return ret;
+}
+}
 
 ObDDLTaskSerializeField::ObDDLTaskSerializeField()
 {
@@ -552,8 +599,7 @@ int ObDDLUtil::generate_column_name_str(
   ObArenaAllocator allocator("ObDDLTmp");
   ObString escaped_column_name = column_name_info.column_name_;
   if ((with_origin_name || with_alias_name)
-      && OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-          allocator, column_name_info.column_name_, escaped_column_name))) {
+      && OB_FAIL(escape_ddl_identifier(allocator, column_name_info.column_name_, escaped_column_name))) {
   }
   // append comma
   if (OB_SUCC(ret) && with_comma) {
