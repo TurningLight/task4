@@ -142,6 +142,9 @@ int knn_search(obvsag::VectorIndexPtr index_handler, uint32_t len, uint32_t *dim
 int fserialize(obvsag::VectorIndexPtr index_handler, std::ostream& out_stream);
 
 int fdeserialize(obvsag::VectorIndexPtr& index_handler, std::istream& in_stream);
+// [GPU-only] lib=cuvs snapshot payload (accumulated buffer, no VSAG graph).
+int cuvs_serialize(obvsag::VectorIndexPtr& index_handler, std::ostream& out_stream);
+int cuvs_deserialize(obvsag::VectorIndexPtr& index_handler, std::istream& in_stream);
 int delete_index(obvsag::VectorIndexPtr& index_handler);
 void delete_iter_ctx(void *iter_ctx);
 int immutable_optimize(obvsag::VectorIndexPtr& index_handler);

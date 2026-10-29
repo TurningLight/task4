@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <mutex>
@@ -149,6 +151,29 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
 }
+// [GPU-only] Restore the accumulation buffer read back from a persisted
+// snapshot (CREATE INDEX on pre-loaded data, or a restart). Does NOT build the
+// CAGRA graph here: the first search builds it on the large-stack worker thread,
+// so a restore never runs cuVS on an OB worker thread.
+static void ob_cuvs_load_buffer(void *key, const float *vectors, const int64_t *ids,
+                                int dim, int size) {
+  if (key == nullptr || dim <= 0 || size < 0) { return; }
+  std::vector<float> vecs;
+  std::vector<int64_t> vids;
+  if (size > 0 && vectors != nullptr && ids != nullptr) {
+    vecs.assign(vectors, vectors + static_cast<size_t>(dim) * size);
+    vids.assign(ids, ids + size);
+  }
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+  if (slot == nullptr) { slot = new ObCuvsEntry(); }
+  slot->dim_ = dim;
+  slot->buf_vecs_.swap(vecs);
+  slot->buf_ids_.swap(vids);
+  if (slot->bridge_ != nullptr) { seekdb_cuvs_free(slot->bridge_); slot->bridge_ = nullptr; }
+  slot->built_n_ = 0;
+  slot->ids_.clear();
+}
 static void ob_cuvs_erase(void *key) {
   { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
@@ -169,6 +194,74 @@ static int64_t ob_cuvs_count(void *key) {
   const size_t buf_n = it->second->buf_ids_.size();
   return static_cast<int64_t>(ids_n > buf_n ? ids_n : buf_n);
 }
+// [FALLBACK] Exact CPU scan over the accumulation buffer. cuVS serves the
+// unfiltered top-k; a filtered query (WHERE predicate or deleted rows) and a
+// table too small for a CAGRA graph are answered here instead. This keeps a
+// lib=cuvs index correct without a CPU HNSW sidecar: it never returns rows the
+// filter excludes and never returns empty just because the VSAG index is empty.
+// The caller holds g_ob_cuvs_mu. Returns the number of rows written.
+static int64_t ob_cuvs_bruteforce(const ObCuvsEntry *ent, vsag::Allocator *alloc,
+                                  const float *query, int64_t topk,
+                                  void *filter, bool reverse_filter,
+                                  const float *&dist, const int64_t *&ids) {
+  if (ent == nullptr || query == nullptr || topk <= 0 || ent->dim_ <= 0) { return 0; }
+  const int64_t n = static_cast<int64_t>(ent->buf_ids_.size());
+  const int64_t dim = ent->dim_;
+  const float *vecs = ent->buf_vecs_.data();
+  if (n <= 0 || vecs == nullptr || static_cast<int64_t>(ent->buf_vecs_.size()) < n * dim) {
+    return 0;
+  }
+  FilterInterface *fi = static_cast<FilterInterface *>(filter);
+  const int64_t k = topk < n ? topk : n;
+  // Max-heap on distance: the k smallest candidates seen so far.
+  std::vector<std::pair<float, int64_t>> heap;
+  heap.reserve(static_cast<size_t>(k) + 1);
+  for (int64_t i = 0; i < n; ++i) {
+    const int64_t vid = ent->buf_ids_[i];
+    if (fi != nullptr) {
+      // Same filter semantics as VSAG: a row is valid iff
+      // reverse_filter ? test(vid) : !test(vid).
+      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
+      if (!valid) { continue; }
+    }
+    const float *v = vecs + i * dim;
+    float d = 0.0f;
+    for (int64_t j = 0; j < dim; ++j) {
+      const float t = query[j] - v[j];
+      d += t * t;
+    }
+    if (static_cast<int64_t>(heap.size()) < k) {
+      heap.emplace_back(d, vid);
+      std::push_heap(heap.begin(), heap.end());
+    } else if (d < heap.front().first) {
+      std::pop_heap(heap.begin(), heap.end());
+      heap.back() = std::make_pair(d, vid);
+      std::push_heap(heap.begin(), heap.end());
+    }
+  }
+  const int64_t cnt = static_cast<int64_t>(heap.size());
+  if (cnt <= 0) { return 0; }
+  int64_t *out_ids = static_cast<int64_t *>(
+      alloc ? alloc->Allocate(sizeof(int64_t) * cnt) : ::malloc(sizeof(int64_t) * cnt));
+  float *out_dist = static_cast<float *>(
+      alloc ? alloc->Allocate(sizeof(float) * cnt) : ::malloc(sizeof(float) * cnt));
+  if (out_ids == nullptr || out_dist == nullptr) {
+    if (alloc) { if (out_ids) alloc->Deallocate(out_ids); if (out_dist) alloc->Deallocate(out_dist); }
+    else { ::free(out_ids); ::free(out_dist); }
+    return 0;
+  }
+  // Repeated pop_heap yields descending distance; fill the arrays backwards so
+  // the result is ordered nearest-first.
+  for (int64_t i = cnt - 1; i >= 0; --i) {
+    std::pop_heap(heap.begin(), heap.end());
+    out_ids[i] = heap.back().second;
+    out_dist[i] = heap.back().first;
+    heap.pop_back();
+  }
+  ids = out_ids;
+  dist = out_dist;
+  return cnt;
+}
 struct ObCuvsJob {
   ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
   bool need_build; std::vector<unsigned> *off; std::vector<float> *dst;
@@ -179,12 +272,21 @@ struct ObCuvsJob {
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
   if (j->need_build) {
+    const auto t0 = std::chrono::steady_clock::now();
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
+    const int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
       j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
       j->built_ = true;
+      // Evidence for the "GPU build path" check: one line per CAGRA build.
+      LOG_INFO("[OBVSAG][cuVS] built CAGRA on the AMD GPU (hipVS)",
+               K(static_cast<int64_t>(j->n)), K(j->dim), K(elapsed_us));
+    } else {
+      LOG_WARN_RET(OB_ERR_UNEXPECTED, "[OBVSAG][cuVS] CAGRA build failed on the GPU",
+                   K(static_cast<int64_t>(j->n)), K(j->dim));
     }
   }
   // Freshness/correctness: only serve from the GPU when the cuVS index is
@@ -250,14 +352,24 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   if (topk <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
-  if (it == g_ob_cuvs_reg.end()) { return false; }
+  if (it == g_ob_cuvs_reg.end() || it->second == nullptr) { return false; }
   ObCuvsEntry *ent = it->second;
+  const size_t n = ent->buf_ids_.size();
+  // Filtered queries (WHERE predicate / deleted rows) and tables too small for a
+  // CAGRA graph are answered by an exact CPU scan over the same buffer: cuVS
+  // returns unfiltered top-k, and on a GPU-only index the VSAG sidecar is empty,
+  // so there is nothing correct to fall back to.
+  if (filter != nullptr || n < OB_CUVS_MIN_PTS) {
+    result_size = ob_cuvs_bruteforce(ent, alloc, query, topk, filter, reverse_filter, dist, ids);
+    if (result_size > 0) {
+      ob_vsag_trace("cuvs_cpu_scan", key, static_cast<long>(result_size), static_cast<long>(n));
+    }
+    return result_size > 0;
+  }
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
   // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
-  const size_t n = ent->buf_ids_.size();
-  const bool need_build =
-      (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n != ent->built_n_));
+  const bool need_build = (ent->bridge_ == nullptr || n != ent->built_n_);
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
@@ -266,18 +378,13 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
-  // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
-  // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
-  // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
-  // excluded, fall back to VSAG (the true filtered top-k may rank beyond k here).
-  if (filter != nullptr) {
-    FilterInterface *fi = static_cast<FilterInterface *>(filter);
-    for (int64_t i = 0; i < topk; ++i) {
-      int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
-      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
-      if (!valid) { return false; }
-    }
+  if (ent->bridge_ == nullptr || job.rc_ != 0) {
+    // GPU unavailable or the CAGRA build/search failed: serve the exact result
+    // from the buffer (this is a fallback, never counted as GPU acceleration).
+    LOG_WARN_RET(OB_ERR_UNEXPECTED, "[OBVSAG][cuVS] GPU search unavailable, fallback to CPU exact scan",
+                 KP(key), K(static_cast<int64_t>(n)), K(job.rc_));
+    result_size = ob_cuvs_bruteforce(ent, alloc, query, topk, nullptr, reverse_filter, dist, ids);
+    return result_size > 0;
   }
   int64_t *out_ids = static_cast<int64_t *>(
       alloc ? alloc->Allocate(sizeof(int64_t) * topk) : ::malloc(sizeof(int64_t) * topk));
@@ -1660,6 +1767,111 @@ int fdeserialize(VectorIndexPtr &index_handler,
   return ret;
 }
 
+// [GPU-only] Snapshot payload for a lib=cuvs index: a flat, self-describing
+// buffer instead of a VSAG graph. The CPU index is empty on this path, so the
+// VSAG serializer has nothing to write; without this the snapshot table stays
+// empty and a query served from a re-created adaptor (CREATE INDEX on
+// pre-loaded data, or a restart) sees zero rows.
+// Layout: magic[8] | int64 n | int64 dim | int64 ids[n] | float vecs[n*dim].
+static const char OB_CUVS_SER_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '1'};
+
+int cuvs_serialize(VectorIndexPtr &index_handler, std::ostream &out_stream)
+{
+  int ret = OB_SUCCESS;
+  if (index_handler == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(index_handler);
+    if (it == g_ob_cuvs_reg.end() || it->second == nullptr) {
+      ret = OB_NOT_INIT;
+    } else {
+      const ObCuvsEntry *ent = it->second;
+      const int64_t n = static_cast<int64_t>(ent->buf_ids_.size());
+      const int64_t dim = ent->dim_;
+      const int64_t vecs_n = static_cast<int64_t>(ent->buf_vecs_.size());
+      if (n < 0 || dim <= 0 || vecs_n != n * dim) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[OBVSAG][cuVS] inconsistent GPU buffer", K(n), K(dim), K(vecs_n));
+      } else {
+        out_stream.write(OB_CUVS_SER_MAGIC, sizeof(OB_CUVS_SER_MAGIC));
+        out_stream.write(reinterpret_cast<const char *>(&n), sizeof(n));
+        out_stream.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
+        if (n > 0) {
+          out_stream.write(reinterpret_cast<const char *>(ent->buf_ids_.data()),
+                           static_cast<std::streamsize>(sizeof(int64_t) * n));
+          out_stream.write(reinterpret_cast<const char *>(ent->buf_vecs_.data()),
+                           static_cast<std::streamsize>(sizeof(float) * vecs_n));
+        }
+        if (!out_stream.good()) {
+          ret = OB_IO_ERROR;
+          LOG_WARN("[OBVSAG][cuVS] write snapshot buffer failed", K(n), K(dim));
+        } else {
+          LOG_INFO("[OBVSAG][cuVS] serialized GPU buffer into the snapshot", K(n), K(dim));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int cuvs_deserialize(VectorIndexPtr &index_handler, std::istream &in_stream)
+{
+  int ret = OB_SUCCESS;
+  if (index_handler == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    char magic[sizeof(OB_CUVS_SER_MAGIC)] = {0};
+    in_stream.read(magic, sizeof(magic));
+    const std::streamsize magic_got = in_stream.gcount();
+    if (magic_got == 0) {
+      // Empty snapshot table: nothing was persisted, keep the buffer as is.
+      LOG_INFO("[OBVSAG][cuVS] empty snapshot, nothing to restore");
+    } else if (magic_got != static_cast<std::streamsize>(sizeof(magic))
+               || 0 != ::memcmp(magic, OB_CUVS_SER_MAGIC, sizeof(magic))) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("[OBVSAG][cuVS] snapshot is not a cuVS buffer", K(magic_got));
+    } else {
+      int64_t n = 0;
+      int64_t dim = 0;
+      in_stream.read(reinterpret_cast<char *>(&n), sizeof(n));
+      in_stream.read(reinterpret_cast<char *>(&dim), sizeof(dim));
+      const bool valid_size = in_stream.gcount() == static_cast<std::streamsize>(sizeof(dim))
+                              && n >= 0 && dim > 0
+                              && (n == 0 || n <= (INT64_MAX / dim) / static_cast<int64_t>(sizeof(float)))
+                              && n <= 1000000000LL;
+      if (!valid_size) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("[OBVSAG][cuVS] invalid cuVS snapshot header", K(n), K(dim));
+      } else {
+        std::vector<int64_t> ids(static_cast<size_t>(n));
+        std::vector<float> vecs(static_cast<size_t>(n) * static_cast<size_t>(dim));
+        if (n > 0) {
+          const std::streamsize ids_bytes = static_cast<std::streamsize>(sizeof(int64_t) * n);
+          const std::streamsize vec_bytes = static_cast<std::streamsize>(sizeof(float) * n * dim);
+          in_stream.read(reinterpret_cast<char *>(ids.data()), ids_bytes);
+          if (in_stream.gcount() != ids_bytes) {
+            ret = OB_INVALID_DATA;
+          } else {
+            in_stream.read(reinterpret_cast<char *>(vecs.data()), vec_bytes);
+            if (in_stream.gcount() != vec_bytes) {
+              ret = OB_INVALID_DATA;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ob_cuvs_load_buffer(index_handler, vecs.data(), ids.data(),
+                              static_cast<int>(dim), static_cast<int>(n));
+          LOG_INFO("[OBVSAG][cuVS] restored GPU buffer from the snapshot", K(n), K(dim));
+        } else {
+          LOG_WARN("[OBVSAG][cuVS] truncated cuVS snapshot", K(n), K(dim), K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int delete_index(VectorIndexPtr &index_handler)
 {
   int ret = OB_SUCCESS;
@@ -1714,6 +1926,9 @@ int immutable_optimize(VectorIndexPtr& index_handler)
   int ret = OB_SUCCESS;
   if (OB_ISNULL(index_handler)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (ob_cuvs_marked(index_handler)) {
+    // [GPU-only] The VSAG index of a lib=cuvs index is empty by design; freezing
+    // it is meaningless and would fail on an empty graph.
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     if (OB_FAIL(hnsw->immutable_optimize())) {
