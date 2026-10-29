@@ -388,8 +388,9 @@ Please refer to the [document](https://github.com/oceanbase/docker-images/blob/m
 # Linux (one-line install, may need sudo)
 curl -fsSL https://obportal.s3.ap-southeast-1.amazonaws.com/download-center/opensource/seekdb/seekdb_install.sh | bash
 
-# macOS (Homebrew)
+# macOS (Homebrew; Apple silicon, macOS 15 Sequoia or newer)
 brew tap oceanbase/seekdb
+brew trust oceanbase/seekdb   # Homebrew 7+ refuses to load formulas from untrusted taps
 brew install seekdb
 ```
 
