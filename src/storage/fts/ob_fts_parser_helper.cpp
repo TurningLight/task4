@@ -326,6 +326,60 @@ ObFTParseHelper::~ObFTParseHelper()
   reset();
 }
 
+namespace
+{
+// 线程内缓存分词器属性：同一条 SQL / 同一批文档会反复用相同 (parser_name, properties) 初始化，
+// 缓存后可省掉每次调用的 JSON 解析与 JSON 池构造开销。
+struct ObFTPropCacheEntry
+{
+  static const int64_t NAME_CAP = 64;
+  static const int64_t JSON_CAP = 512;
+  char name_[NAME_CAP];
+  int64_t name_len_;
+  char json_[JSON_CAP];
+  int64_t json_len_;
+  ObFTParserProperty prop_;
+  bool valid_;
+  ObFTPropCacheEntry() : name_len_(0), json_len_(0), prop_(), valid_(false) {}
+};
+thread_local ObFTPropCacheEntry g_ft_prop_cache;
+
+static int parse_property_cached_(const common::ObString &parser_name,
+                                  const common::ObString &json_props,
+                                  const ObFTParser &parser,
+                                  ObFTParserProperty &property)
+{
+  int ret = OB_SUCCESS;
+  ObFTPropCacheEntry &cache = g_ft_prop_cache;
+  const bool cacheable = parser_name.length() <= ObFTPropCacheEntry::NAME_CAP
+                         && json_props.length() <= ObFTPropCacheEntry::JSON_CAP;
+  bool hit = false;
+  if (cacheable && cache.valid_
+      && cache.name_len_ == parser_name.length()
+      && cache.json_len_ == json_props.length()) {
+    hit = (0 == parser_name.length() || 0 == MEMCMP(cache.name_, parser_name.ptr(), parser_name.length()))
+          && (0 == json_props.length() || 0 == MEMCMP(cache.json_, json_props.ptr(), json_props.length()));
+  }
+  if (hit) {
+    property = cache.prop_;
+  } else if (OB_FAIL(property.parse_for_parser_helper(parser, json_props))) {
+  } else if (!cacheable) {
+  } else {
+    if (parser_name.length() > 0) {
+      MEMCPY(cache.name_, parser_name.ptr(), parser_name.length());
+    }
+    cache.name_len_ = parser_name.length();
+    if (json_props.length() > 0) {
+      MEMCPY(cache.json_, json_props.ptr(), json_props.length());
+    }
+    cache.json_len_ = json_props.length();
+    cache.prop_ = property;
+    cache.valid_ = true;
+  }
+  return ret;
+}
+}  // namespace
+
 int ObFTParseHelper::init(
     common::ObIAllocator *allocator,
     const common::ObString &parser_name,
@@ -337,7 +391,7 @@ int ObFTParseHelper::init(
   } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
-  } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
+  } else if (OB_FAIL(parse_property_cached_(parser_name, parser_properties, parser_name_, parser_property_))) {
   } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
   } else if (OB_ISNULL(parser_desc_)) {
     ret = OB_ERR_UNEXPECTED;
