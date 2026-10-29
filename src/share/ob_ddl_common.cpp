@@ -32,12 +32,53 @@
 #include "common/object/ob_object.h"
 #include "share/tablet/ob_tablet_table_operator.h"
 #include "share/storage/ob_tablet_local_checksum_table_storage.h"
-#include "sql/ob_sql_utils.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::blocksstable;
+
+namespace oceanbase {
+namespace share {
+
+static int generate_escaped_identifier(
+    ObIAllocator &allocator,
+    const ObString &src_name,
+    ObString &dest_name)
+{
+  int ret = OB_SUCCESS;
+  int64_t escaped_len = 0;
+  const char *ptr = src_name.ptr();
+  const int64_t len = src_name.length();
+
+  for (int64_t i = 0; i < len; i++) {
+    if (ptr[i] == '`') {
+      escaped_len += 2;
+    } else {
+      escaped_len++;
+    }
+  }
+
+  char *buf = static_cast<char *>(allocator.alloc(escaped_len));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t pos = 0;
+    for (int64_t i = 0; i < len; i++) {
+      if (ptr[i] == '`') {
+        buf[pos++] = '`';
+        buf[pos++] = '`';
+      } else {
+        buf[pos++] = ptr[i];
+      }
+    }
+    dest_name.assign_ptr(buf, static_cast<int32_t>(escaped_len));
+  }
+  return ret;
+}
+
+} // namespace share
+} // namespace oceanbase
 
 ObDDLTaskSerializeField::ObDDLTaskSerializeField()
 {
@@ -553,7 +594,7 @@ int ObDDLUtil::generate_column_name_str(
   ObArenaAllocator allocator("ObDDLTmp");
   ObString escaped_column_name = column_name_info.column_name_;
   if ((with_origin_name || with_alias_name)
-      && OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
+      && OB_FAIL(generate_escaped_identifier(
           allocator, column_name_info.column_name_, escaped_column_name))) {
   }
   // append comma
