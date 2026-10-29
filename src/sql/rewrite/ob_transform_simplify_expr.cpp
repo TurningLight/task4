@@ -26,6 +26,13 @@ using namespace oceanbase::sql;
 
 namespace
 {
+// Duplicate elimination compares every pair of operands, so bound the work by
+// the number of comparisons instead of by a fixed operand count.  The old
+// 100-operand cutoff skipped simplification for still-reasonable lists (for
+// example 128 repeated disjuncts) while a comparison budget keeps the worst
+// case predictable.
+constexpr int64_t MAX_DEDUP_COMPARISONS = 100000;
+
 int has_scalar_in_predicate(ObRawExpr *expr, bool &has_in)
 {
   int ret = OB_SUCCESS;
@@ -2611,7 +2618,7 @@ int ObTransformSimplifyExpr::remove_duplicate_exprs(ObQueryCtx* query_ctx,
     //select * from t1 where c1 > 1 and c1 > 1
     //like above stmt, and expr in level 0 is process here
     ObSEArray<ObRawExpr *, 4> param_conds;
-    if (param_count <= 1 || param_count > 100) {
+    if (param_count <= 1 || param_count * param_count > MAX_DEDUP_COMPARISONS) {
       /* use too much resource and need add lots of constraints */
     } else if (OB_FAIL(param_conds.assign(conditions))) {
     } else if (OB_FAIL(do_remove_duplicate_exprs(*query_ctx, param_conds))) {
@@ -2655,7 +2662,7 @@ int ObTransformSimplifyExpr::recursive_remove_duplicate_exprs(ObQueryCtx &query_
     } else if (expr->get_expr_type() == T_OP_OR || expr->get_expr_type() == T_OP_AND) {
       ObOpRawExpr *op_expr = static_cast<ObOpRawExpr *>(expr);
       ObSEArray<ObRawExpr *, 4> param_conds;
-      if (op_expr->get_param_count() > 100) {
+      if (op_expr->get_param_count() * op_expr->get_param_count() > MAX_DEDUP_COMPARISONS) {
         /* use too much resource and need add lots of constraints */
       } else if (OB_FAIL(param_conds.assign(op_expr->get_param_exprs()))) {
       } else if (OB_FAIL(do_remove_duplicate_exprs(query_ctx, param_conds))) {
