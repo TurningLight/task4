@@ -1,0 +1,71 @@
+Query Plan
+==========================================================================
+|ID|OPERATOR                               |NAME                         |
+--------------------------------------------------------------------------
+|0 |VECTOR INDEX ADAPTIVE SCAN (PRE-FILTER)|ann_redundant_bounds(idx_age)|
+==========================================================================
+Outputs & filters:
+-------------------------------------
+  0 - output([ann_redundant_bounds.id]), filter([ann_redundant_bounds.age < 10]), rowset=16
+      access([ann_redundant_bounds.__pk_increment], [ann_redundant_bounds.age], [ann_redundant_bounds.id]), partitions(p0)
+      is_index_back=true, is_global_index=false, filter_before_indexback[true],
+      range_key([ann_redundant_bounds.age], [ann_redundant_bounds.__pk_increment]), range(NULL,MAX ; 10,MIN)
+id
+1
+2
+6
+8
+id
+1
+2
+3
+4
+7
+id
+1
+2
+6
+8
+id
+1
+2
+6
+8
+id
+1
+2
+3
+4
+6
+7
+8
+Query Plan
+==========================================================================
+|ID|OPERATOR                               |NAME                         |
+--------------------------------------------------------------------------
+|0 |VECTOR INDEX ADAPTIVE SCAN (PRE-FILTER)|ann_redundant_bounds(idx_age)|
+==========================================================================
+Outputs & filters:
+-------------------------------------
+  0 - output([ann_redundant_bounds.id]), filter([ann_redundant_bounds.age < 10], [ann_redundant_bounds.age < 20]), rowset=16
+      access([ann_redundant_bounds.__pk_increment], [ann_redundant_bounds.age], [ann_redundant_bounds.id]), partitions(p0)
+      is_index_back=true, is_global_index=false, filter_before_indexback[true,true],
+      range_key([ann_redundant_bounds.age], [ann_redundant_bounds.__pk_increment]), range(NULL,MAX ; 10,MIN)
+id
+1
+2
+6
+8
+id
+1
+2
+6
+8
+id
+1
+2
+3
+6
+8
+id
+id

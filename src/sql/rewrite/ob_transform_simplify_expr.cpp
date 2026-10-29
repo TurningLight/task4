@@ -26,6 +26,106 @@ using namespace oceanbase::sql;
 
 namespace
 {
+struct ANNIntegerBound
+{
+  ANNIntegerBound()
+    : column_(NULL), constant_(NULL), is_upper_(false), is_strict_(false)
+  {}
+
+  ObRawExpr *column_;
+  ObRawExpr *constant_;
+  ObObj value_;
+  bool is_upper_;
+  bool is_strict_;
+};
+
+bool get_ann_integer_bound(ObTransformerCtx *ctx,
+                           ObRawExpr *expr,
+                           ANNIntegerBound &bound)
+{
+  int ret = OB_SUCCESS;
+  bool valid = false;
+  bound.column_ = NULL;
+  bound.constant_ = NULL;
+  bound.is_upper_ = false;
+  bound.is_strict_ = false;
+  if (NULL != expr && 2 == expr->get_param_count()) {
+    ObItemType cmp_type = expr->get_expr_type();
+    if (T_OP_LT == cmp_type || T_OP_LE == cmp_type
+        || T_OP_GT == cmp_type || T_OP_GE == cmp_type) {
+      ObRawExpr *left = expr->get_param_expr(0);
+      ObRawExpr *right = expr->get_param_expr(1);
+      ObRawExpr *column = NULL;
+      ObRawExpr *constant = NULL;
+      if (NULL != left && NULL != right) {
+        if (left->is_column_ref_expr() && right->is_const_raw_expr()) {
+          column = left;
+          constant = right;
+        } else if (right->is_column_ref_expr() && left->is_const_raw_expr()) {
+          column = right;
+          constant = left;
+          if (T_OP_LT == cmp_type) {
+            cmp_type = T_OP_GT;
+          } else if (T_OP_LE == cmp_type) {
+            cmp_type = T_OP_GE;
+          } else if (T_OP_GT == cmp_type) {
+            cmp_type = T_OP_LT;
+          } else {
+            cmp_type = T_OP_LE;
+          }
+        }
+      }
+      if (NULL != column && NULL != constant
+          && !static_cast<const ObConstRawExpr *>(constant)
+                  ->is_dynamic_eval_questionmark()
+          && ob_is_int_tc(column->get_result_type().get_type())) {
+        ObObj value;
+        bool got_result = false;
+        bool has_warning = false;
+        if (OB_FAIL(ObTransformUtils::calc_const_expr_result(
+                constant, ctx, value, got_result, &has_warning))) {
+          LOG_WARN("failed to calculate ANN integer bound", K(ret));
+        } else if (got_result && !has_warning
+                   && !value.is_null() && ob_is_int_tc(value.get_type())) {
+          bound.column_ = column;
+          bound.constant_ = constant;
+          bound.value_ = value;
+          bound.is_upper_ = T_OP_LT == cmp_type || T_OP_LE == cmp_type;
+          bound.is_strict_ = T_OP_LT == cmp_type || T_OP_GT == cmp_type;
+          valid = true;
+        }
+      }
+    }
+  }
+  return valid;
+}
+
+bool is_same_ann_integer_column(const ANNIntegerBound &left,
+                                const ANNIntegerBound &right)
+{
+  const ObColumnRefRawExpr *left_column =
+      static_cast<const ObColumnRefRawExpr *>(left.column_);
+  const ObColumnRefRawExpr *right_column =
+      static_cast<const ObColumnRefRawExpr *>(right.column_);
+  return left_column->get_table_id() == right_column->get_table_id()
+         && left_column->get_column_id() == right_column->get_column_id();
+}
+
+bool ann_bound_strictly_implies(const ANNIntegerBound &stronger,
+                                const ANNIntegerBound &weaker,
+                                const int cmp)
+{
+  bool implies = false;
+  if (stronger.is_upper_) {
+    implies = cmp < 0
+              || (0 == cmp && stronger.is_strict_ && !weaker.is_strict_);
+  } else {
+    implies = cmp > 0
+              || (0 == cmp && stronger.is_strict_ && !weaker.is_strict_);
+  }
+  return implies;
+}
+
 int has_scalar_in_predicate(ObRawExpr *expr, bool &has_in)
 {
   int ret = OB_SUCCESS;
@@ -62,6 +162,21 @@ int ObTransformSimplifyExpr::transform_one_stmt(common::ObIArray<ObParentDMLStmt
   UNUSED(parent_stmts);
   if (OB_ISNULL(stmt) || OB_ISNULL(stmt->get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
+  }
+  if (OB_SUCC(ret) && stmt->has_vec_approx()) {
+    bool flatten_happened = false;
+    bool ann_happened = false;
+    if (OB_FAIL(flatten_stmt_exprs(stmt, flatten_happened))) {
+    } else {
+      trans_happened |= flatten_happened;
+      if (OB_FAIL(simplify_ann_integer_bounds(*stmt, ann_happened))) {
+        return ret;
+      }
+      trans_happened |= ann_happened;
+      if (ann_happened && OB_FAIL(add_transform_hint(*stmt))) {
+      }
+    }
+    return ret;
   }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(flatten_stmt_exprs(stmt, is_happened))) {
@@ -134,6 +249,96 @@ int ObTransformSimplifyExpr::transform_one_stmt(common::ObIArray<ObParentDMLStmt
   }
   if (OB_SUCC(ret) && trans_happened) {
     if (OB_FAIL(add_transform_hint(*stmt))) {
+    }
+  }
+  return ret;
+}
+
+int ObTransformSimplifyExpr::simplify_ann_integer_bounds(
+    ObDMLStmt &stmt, bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  const int64_t max_condition_count = 256;
+  trans_happened = false;
+  ObIArray<ObRawExpr *> &conditions = stmt.get_condition_exprs();
+  if (conditions.count() > max_condition_count) {
+    // Keep the rewrite bounded for pathological predicates.
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < conditions.count(); ++i) {
+      ANNIntegerBound current;
+      if (!get_ann_integer_bound(ctx_, conditions.at(i), current)) {
+        continue;
+      }
+      for (int64_t j = i + 1; OB_SUCC(ret) && j < conditions.count();) {
+        ANNIntegerBound other;
+        if (!get_ann_integer_bound(ctx_, conditions.at(j), other)
+            || current.is_upper_ != other.is_upper_
+            || !is_same_ann_integer_column(current, other)) {
+          ++j;
+        } else {
+          int cmp = 0;
+          if (OB_FAIL(current.value_.compare(other.value_, cmp))) {
+            LOG_WARN("failed to compare integer bounds", K(ret));
+          } else if (ann_bound_strictly_implies(current, other, cmp)) {
+            if (OB_FAIL(add_ann_bound_constraint(
+                    current.constant_, other.constant_, current.is_upper_,
+                    current.is_strict_, other.is_strict_))) {
+              LOG_WARN("failed to add ANN bound constraint", K(ret));
+            } else if (OB_FAIL(conditions.remove(j))) {
+              LOG_WARN("failed to remove implied ANN bound", K(ret), K(j));
+            } else {
+              trans_happened = true;
+            }
+          } else if (ann_bound_strictly_implies(other, current, -cmp)) {
+            if (OB_FAIL(add_ann_bound_constraint(
+                    other.constant_, current.constant_, other.is_upper_,
+                    other.is_strict_, current.is_strict_))) {
+              LOG_WARN("failed to add ANN bound constraint", K(ret));
+            } else if (OB_FAIL(conditions.remove(i))) {
+              LOG_WARN("failed to remove implied ANN bound", K(ret), K(i));
+            } else {
+              trans_happened = true;
+              --i;
+            }
+            break;
+          } else {
+            ++j;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformSimplifyExpr::add_ann_bound_constraint(
+    ObRawExpr *stronger_bound,
+    ObRawExpr *weaker_bound,
+    const bool is_upper,
+    const bool stronger_is_strict,
+    const bool weaker_is_strict)
+{
+  int ret = OB_SUCCESS;
+  ObRawExpr *constraint = NULL;
+  if (OB_ISNULL(ctx_) || OB_ISNULL(ctx_->expr_factory_)
+      || OB_ISNULL(ctx_->session_info_)
+      || OB_ISNULL(stronger_bound) || OB_ISNULL(weaker_bound)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const bool allow_equal = stronger_is_strict || !weaker_is_strict;
+    const ObItemType compare_type =
+        is_upper
+            ? (allow_equal ? T_OP_LE : T_OP_LT)
+            : (allow_equal ? T_OP_GE : T_OP_GT);
+    if (OB_FAIL(ObRawExprUtils::build_common_binary_op_expr(
+            *ctx_->expr_factory_, compare_type,
+            stronger_bound, weaker_bound, constraint))) {
+      LOG_WARN("failed to build ANN bound constraint", K(ret));
+    } else if (OB_FAIL(constraint->formalize(ctx_->session_info_))) {
+      LOG_WARN("failed to formalize ANN bound constraint", K(ret));
+    } else if (OB_FAIL(ObTransformUtils::add_param_bool_constraint(
+                   ctx_, constraint, true))) {
+      LOG_WARN("failed to add ANN bound parameter constraint", K(ret));
     }
   }
   return ret;
