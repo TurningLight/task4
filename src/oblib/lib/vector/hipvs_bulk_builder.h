@@ -12,6 +12,9 @@ namespace oceanbase { namespace common { namespace obvsag {
 // engine, so query filtering, allocator ownership and persistence stay native.
 class HipvsBulkBuilder {
 public:
+  // Explicit environment overrides win; otherwise use only an executable
+  // sibling of the running seekdb binary (never search cwd or PATH).
+  static std::string find_worker();
   HipvsBulkBuilder(std::string worker, int dim, int degree, int ef_construction)
     : worker_(std::move(worker)), dim_(dim), degree_(degree), ef_construction_(ef_construction) {}
   void append(const float *vectors, const int64_t *ids, int dim, int count);

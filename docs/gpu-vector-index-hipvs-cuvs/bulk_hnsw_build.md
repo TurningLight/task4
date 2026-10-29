@@ -6,7 +6,7 @@ The CPU `lib=vsag` path is preserved. This is a build optimization, not a batch-
 
 ## Algorithm and integration
 
-The reference `lib=cuvs` implementation constructs the CPU HNSW and may additionally build a GPU CAGRA graph during queries. This implementation enables a separate bulk path only when `SEEKDB_HIPVS_BUILD_WORKER` is configured and a supported snapshot is being populated.
+The reference `lib=cuvs` implementation constructs the CPU HNSW and may additionally build a GPU CAGRA graph during queries. This implementation enables a separate bulk path for supported snapshots when the build worker is installed next to the running seekdb executable, or when an explicit `SEEKDB_HIPVS_BUILD_WORKER` override is supplied. It never searches the current directory or PATH. An explicitly empty override disables bulk construction.
 
 1. `ObPluginVectorIndexAdaptor::add_snap_index` selects bulk staging for the snapshot. Incremental/delta ingestion retains the reference implementation.
 2. `HipvsBulkBuilder` stores every input vector and its original 64-bit ID. Buffer capacity grows geometrically, including when the storage layer sends individual rows. Duplicate IDs, nonfinite values and mismatched dimensions are rejected.
@@ -33,22 +33,19 @@ The reference hipVS integration is an unmerged prerequisite. This change is base
 
 ## Build
 
-Check out the submitted source revision. Initialize seekdb's ordinary build dependencies using `./build.sh release --init`, or reuse the competition image's matching cache. If reusing the cache, set `SEEKDB_DEPS_CACHE` to its actual `3rd` directory and create `deps/3rd` only when it does not already exist:
+Check out the submitted source revision. In the competition image, the ordinary command is sufficient:
 
 ```bash
-test -d "$SEEKDB_DEPS_CACHE"
-test -e deps/3rd || ln -s "$SEEKDB_DEPS_CACHE" deps/3rd
-
-./build.sh release \
-  -DOB_BUILD_CUVS=ON \
-  -DCUVS_BRIDGE_LIB=/seekdb_workspace/bridge/libseekdb_cuvs_bridge.so \
-  --make -j8
-
-bash tools/hipvs_bridge/build_hnsw_worker.sh \
-  "$PWD/build_release/seekdb-hipvs-hnsw-build"
+./build.sh release --init --make -j8
 ```
 
-On the tested image, Rust dependencies were already cached; `CARGO_NET_OFFLINE=true` allowed the build without fetching the crates registry. This option requires a complete cache. On a fresh environment, use the standard dependency initialization/network setup instead of assuming the cache exists.
+`build.sh` reuses `/opt/seekdb-deps-cache/<manifest-md5>/3rd` only when the dependency manifest matches and its completion markers exist; an existing `deps/3rd` is not replaced. CMake detects preinstalled hipcc, hipVS headers/libraries and `/seekdb_workspace/bridge/libseekdb_cuvs_bridge.so`, enables `OB_BUILD_CUVS`, and builds the worker as a dependency of `seekdb`. The worker appears at `build_release/src/observer/seekdb-hipvs-hnsw-build` and is included in the server installation's `bin/` directory.
+
+The Rust workspace now commits `Cargo.lock`; CMake always uses `--locked`. On the detected competition image it also uses `--offline` and `CARGO_NET_OFFLINE=true`. The lock was resolved against the image's existing registry cache with Rust 1.97.1. Missing cached crates cause an explicit failure rather than an automatic download. Other environments still need the documented C++/Rust dependencies; this does not make an empty machine self-contained.
+
+For a custom preinstalled layout, set `SEEKDB_HIPVS_ROOT`, `SEEKDB_ROCM_ROOT`, `SEEKDB_HIPCC`, and `CUVS_BRIDGE_LIB` as CMake options. Explicit `-DOB_BUILD_CUVS=OFF` retains the CPU build, even in the image. Explicit GPU enablement with a missing bridge fails during configuration. `-DSEEKDB_OFFLINE_BUILD=ON` enables the locked offline Rust build outside the image as well.
+
+When copying the server manually, copy its worker alongside it. Copying only the seekdb executable does not copy the separate GPU worker. Normal CMake server installation includes both. The evaluator's build/copy/run contract is not public; these default-build checks do not by themselves prove compatibility with an undisclosed evaluator command.
 
 The worker build supports `HIPVS_ROOT` and `ROCM_ROOT`; defaults are `/opt/hipvs` and `/opt/rocm`. No system library is replaced. A CPU-only seekdb build leaves `OB_BUILD_CUVS` disabled and does not need the worker.
 
@@ -58,8 +55,6 @@ Use a new data directory and an unused port. Do not overwrite an existing instan
 
 ```bash
 mkdir -p run/hipvs-candidate
-export SEEKDB_HIPVS_BUILD_WORKER="$PWD/build_release/seekdb-hipvs-hnsw-build"
-export LD_LIBRARY_PATH=/seekdb_workspace/bridge:/opt/hipvs/lib:/opt/rocm/lib
 export OMP_NUM_THREADS=8
 export TZ=UTC
 
@@ -70,6 +65,11 @@ build_release/src/observer/seekdb \
   --parameter datafile_maxsize=24G --parameter log_disk_size=4G \
   --log-level INFO
 ```
+
+The example uses neither `SEEKDB_HIPVS_BUILD_WORKER` nor `LD_LIBRARY_PATH`: the
+adjacent worker is found automatically and the tested image already configures
+its runtime libraries. Start from a shell without an old worker override. For a
+separately built worker, an explicit absolute-path override remains supported.
 
 Use the original image binary for the CPU baseline in a separate new directory, with the same resource parameters and a different port (the examples use 2881). Do not set the worker variable on the baseline process. Run CPU and GPU measurements sequentially on the same machine. Stop unrelated compilers, benchmarks and GPU jobs before measurement.
 
@@ -100,13 +100,16 @@ The self-contained tools are under `unittest/oblib/vector/hipvs_validation`:
 
 ```bash
 cd unittest/oblib/vector/hipvs_validation
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m unittest -v test_offline
-python preflight.py --home /seekdb_workspace --out runs/environment.json
-python make_dataset.py --out datasets/dev100k --n 100000 --dim 128 --queries 100 --k 10
+/opt/venv/bin/python -m unittest -v test_offline
+/opt/venv/bin/python preflight.py --home /seekdb_workspace --out runs/environment.json
+/opt/venv/bin/python make_dataset.py --out datasets/dev100k --n 100000 --dim 128 --queries 100 --k 10
 ```
+
+The image provides NumPy 2.4.6. SQL clients use the committed, SHA-256-checked
+PyMySQL 1.1.2 pure-Python wheel under `vendor/`; no pip installation or download
+is performed. Its license and source notice are included. This is a test-client
+dependency, not a seekdb server dependency. `requirements.txt` remains available
+for provisioning a different development environment in advance.
 
 The synthetic data is for reproducible development measurements, not a substitute for an organizer's dataset. Its ground truth is exhaustive float64 L2 over the exact float32 inputs, with unique noncontiguous 64-bit document IDs. Dataset hashes, random seed, dimensions and numeric precision are saved. When official data/targets become available, run the same procedure with those inputs and rules.
 
@@ -118,7 +121,7 @@ python compare_sql.py \
   --gpu-log /absolute/gpu-data/log/seekdb.log \
   --cpu-binary /seekdb_workspace/bin/seekdb \
   --gpu-binary /absolute/checkout/build_release/src/observer/seekdb \
-  --worker /absolute/checkout/build_release/seekdb-hipvs-hnsw-build \
+  --worker /absolute/checkout/build_release/src/observer/seekdb-hipvs-hnsw-build \
   --rounds 3 --m 32 --ef-search 1000 --min-recall 0.95
 ```
 
@@ -147,7 +150,7 @@ build_release/unittest/oblib/oblib_tests \
 The hardware test is disabled by default so normal CPU CI does not require an AMD GPU. Enable it explicitly:
 
 ```bash
-SEEKDB_HIPVS_TEST_WORKER="$PWD/build_release/seekdb-hipvs-hnsw-build" \
+SEEKDB_HIPVS_TEST_WORKER="$PWD/build_release/src/observer/seekdb-hipvs-hnsw-build" \
 SEEKDB_HIPVS_TEST_DATASET=/seekdb_workspace/datasets \
 build_release/unittest/oblib/oblib_tests \
   --gtest_also_run_disabled_tests \
@@ -161,7 +164,7 @@ The provided wrapper applies the tested runtime settings without modifying syste
 ```bash
 bash tools/hipvs_bridge/run_vector_tests.sh
 bash tools/hipvs_bridge/run_vector_tests.sh --gpu \
-  "$PWD/build_release/seekdb-hipvs-hnsw-build" /seekdb_workspace/datasets
+  "$PWD/build_release/src/observer/seekdb-hipvs-hnsw-build" /seekdb_workspace/datasets
 ```
 
 The SQL persistence check creates a separate fixture and exercises negative/zero/64-bit primary keys, filtering, inserts, updates, deletes and the small-snapshot fallback:
@@ -170,12 +173,24 @@ The SQL persistence check creates a separate fixture and exercises negative/zero
 python sql_regressions.py --phase prepare --state runs/restart-state.json --port 2883
 python sql_regressions.py --phase prepare --library vsag --state runs/cpu-state.json --port 2883
 # Gracefully stop and restart only this test instance with the same data directory.
-# To verify the saved native format, omit SEEKDB_HIPVS_BUILD_WORKER and set
-# HIP_VISIBLE_DEVICES=-1 for the restarted process, then run:
+# To verify the saved native format, set SEEKDB_HIPVS_BUILD_WORKER to the empty
+# string (disables automatic discovery) and HIP_VISIBLE_DEVICES=-1 for the
+# restarted process, then run:
 python sql_regressions.py --phase verify --state runs/restart-state.json --port 2883
 ```
 
 Restore normal GPU visibility on the process used for subsequent GPU build benchmarks. Do not run profiling or regression workloads concurrently with timed CPU/GPU comparisons.
+
+The additional Linux build-integration checks can be run without a GPU:
+
+```bash
+python -m unittest -v test_build_integration
+```
+
+These check CPU defaults, explicit disablement, missing-dependency errors,
+worker target dependencies/installation and real C++ executable-relative
+discovery. The build-wiring fixture uses a fake hipcc and is explicitly not GPU
+execution evidence. Real SQL and profiler records provide that evidence.
 
 ## GPU execution evidence and backups
 
@@ -185,7 +200,7 @@ Generate a regular-file worker input and profile the same worker binary used by 
 python make_worker_input.py --dataset datasets/dev100k --out runs/profile-input.bin --m 32
 OMP_NUM_THREADS=8 rocprofv3 --kernel-trace --memory-copy-trace \
   --output-format csv --output-directory runs/rocprof \
-  -- /absolute/checkout/build_release/seekdb-hipvs-hnsw-build \
+  -- /absolute/checkout/build_release/src/observer/seekdb-hipvs-hnsw-build \
   < runs/profile-input.bin > runs/profile-index.bin 2> runs/rocprof.log
 ```
 

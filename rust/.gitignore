@@ -2,4 +2,5 @@
 # tree (CARGO_TARGET_DIR), but ignore an in-tree `target/` too for standalone
 # `cargo build` runs.
 /target
-/Cargo.lock
+# This workspace links a production server: keep Cargo.lock tracked so CI's
+# --locked checks and pre-populated offline dependency caches are reproducible.

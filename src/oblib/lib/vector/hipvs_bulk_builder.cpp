@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -15,11 +16,32 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 extern char **environ;
 #endif
 
 namespace oceanbase { namespace common { namespace obvsag {
+
+std::string HipvsBulkBuilder::find_worker()
+{
+  const char *override_path = std::getenv("SEEKDB_HIPVS_BUILD_WORKER");
+  if (override_path != nullptr) return override_path; // Empty explicitly disables.
+#if defined(__linux__)
+  char executable[4096];
+  const ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable));
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(executable)) return {};
+  std::string path(executable, static_cast<size_t>(length));
+  const auto slash = path.rfind('/');
+  if (slash == std::string::npos) return {};
+  path.resize(slash + 1);
+  path += "seekdb-hipvs-hnsw-build";
+  struct stat info{};
+  if (stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) && access(path.c_str(), X_OK) == 0)
+    return path;
+#endif
+  return {};
+}
 
 void HipvsBulkBuilder::append(const float *vectors, const int64_t *ids, int dim, int count)
 {

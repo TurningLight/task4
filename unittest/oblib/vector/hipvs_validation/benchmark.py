@@ -155,7 +155,7 @@ def main():
     manifest, base, queries, ids, truth = load_dataset(a.dataset)
     if a.k != manifest["k"]:
         p.error("k must match the exact ground truth")
-    import pymysql
+    from mysql_client import pymysql
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
     database = "amd_hnsw_" + uuid.uuid4().hex[:12]

@@ -15,11 +15,28 @@
 use crate::*;
 
 pub(crate) fn next_request_ticket() -> Option<u64> {
-    NEXT_REQUEST_TICKET
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < usize::MAX as u64).then(|| current + 1)
-        })
-        .ok()
+    reserve_ticket(&NEXT_REQUEST_TICKET)
+}
+
+// Keep the same fetch-update semantics on the pinned Rust and newer toolchains
+// where fetch_update is deprecated but its replacement is not available on old
+// compilers. Never wrap or issue a ticket outside the usize range.
+fn reserve_ticket(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= usize::MAX as u64 {
+            return None;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => return Some(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 pub(crate) fn begin_worker_request(conn: &Arc<Conn>, allow_current_peer_eof: bool) -> Option<u64> {
@@ -826,5 +843,39 @@ pub(crate) fn finish_worker_request(conn: &Arc<Conn>, generation: u64) {
     };
     if let Some(finished) = finished {
         publish_finish(conn, finished);
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::reserve_ticket;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn tickets_return_previous_value_without_wrapping() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(reserve_ticket(&counter), Some(0));
+        assert_eq!(reserve_ticket(&counter), Some(1));
+        let boundary = AtomicU64::new(usize::MAX as u64 - 1);
+        assert_eq!(reserve_ticket(&boundary), Some(usize::MAX as u64 - 1));
+        assert_eq!(reserve_ticket(&boundary), None);
+        assert_eq!(boundary.load(Ordering::Acquire), usize::MAX as u64);
+    }
+
+    #[test]
+    fn concurrent_tickets_are_unique() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    (0..1000).map(|_| reserve_ticket(&counter).unwrap()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut tickets: Vec<_> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        tickets.sort_unstable();
+        assert_eq!(tickets, (0..8000).collect::<Vec<_>>());
     }
 }

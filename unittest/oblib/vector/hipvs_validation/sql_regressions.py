@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
-import pymysql
+from mysql_client import pymysql
 from metrics import vector_literal, write_json
 
 

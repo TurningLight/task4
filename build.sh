@@ -100,11 +100,33 @@ function find_cmake
   fi
 }
 
+# The competition image has an offline cache keyed by this exact dependency
+# manifest. Never pick an arbitrary cached version or overwrite existing deps.
+function reuse_hipvs_image_deps
+{
+  [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || return 0
+  [[ -f /seekdb_workspace/bridge/libseekdb_cuvs_bridge.so && -f /opt/hipvs/lib/libcuvs_c.so ]] || return 0
+  local manifest="$DEP_INIT_DIR/oceanbase.el9.x86_64.deps"
+  local cache_key cache_dir
+  cache_key=$(md5sum "$manifest") || return 1
+  cache_key=${cache_key%% *}
+  cache_dir="/opt/seekdb-deps-cache/$cache_key/3rd"
+  [[ -e "$TOPDIR/deps/3rd" || -L "$TOPDIR/deps/3rd" ]] && return 0
+  if [[ -f "$cache_dir/DONE" && -f "$cache_dir/$cache_key" && -x "$cache_dir/usr/local/oceanbase/devtools/bin/cmake" ]]; then
+    ln -s "$cache_dir" "$TOPDIR/deps/3rd" || return 1
+    echo_log "reusing matching preinstalled hipVS image dependencies: $cache_key"
+  fi
+}
+
 function do_init
 {
   local android_build=$1
   local start_time end_time elapsed
   local status=0
+
+  if [[ "$android_build" == false ]]; then
+    reuse_hipvs_image_deps || return $?
+  fi
 
   if [[ ! -f "${DEP_INIT_DIR}/dep_create.sh" ]]; then
     echo_err "dependency initializer not found: ${DEP_INIT_DIR}/dep_create.sh"
@@ -251,6 +273,9 @@ function do_release
   done
 
   require_host
+  if [[ "$android_build" == false ]]; then
+    reuse_hipvs_image_deps || exit $?
+  fi
   if [[ "${need_init}" == true ]]; then
     do_init "${android_build}" || exit $?
   fi

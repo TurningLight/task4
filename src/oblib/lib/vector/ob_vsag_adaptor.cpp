@@ -480,8 +480,11 @@ bool HnswIndexHandler::enable_hipvs_bulk()
 #if defined(OB_BUILD_CUVS) && defined(__linux__)
   std::lock_guard<std::mutex> guard(hipvs_bulk_mutex_);
   if (hipvs_bulk_) return true;
-  const char *worker = std::getenv("SEEKDB_HIPVS_BUILD_WORKER");
-  if (worker == nullptr || worker[0] == '\0') return false;
+  const std::string worker = HipvsBulkBuilder::find_worker();
+  if (worker.empty()) {
+    LOG_INFO("[HIPVS_BUILD_FALLBACK] no adjacent worker or bulk build explicitly disabled");
+    return false;
+  }
   if (index_type_ != HNSW_TYPE || std::strcmp(metric_, "l2") != 0 ||
       extra_info_size_ != 0 || max_degree_ < 4 || max_degree_ > 128 ||
       index_->GetNumElements() != 0) {

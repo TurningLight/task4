@@ -52,9 +52,9 @@ ob_define(USE_LTO_CACHE OFF)
 # 开源模式默认支持系统租户使用向量索引
 ob_define(OB_BUILD_SYS_VEC_IDX ON)
 
-# [hipVS/cuVS] optional GPU vector-index backend (AMD gfx1100 via hipVS/cuVS); OFF by default.
-ob_define(OB_BUILD_CUVS OFF)
-ob_define(CUVS_BRIDGE_LIB "")
+# Enable the GPU backend automatically only when its complete build dependencies
+# are already present; honor an explicit OFF on all machines.
+include("${CMAKE_CURRENT_LIST_DIR}/HipvsConfig.cmake")
 ob_define(OB_BUILD_CUVS_TRACE OFF)  # developer-only obvsag call-chain tracer
 
 if(WIN32)

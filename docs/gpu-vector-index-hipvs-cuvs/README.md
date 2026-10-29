@@ -9,15 +9,19 @@ history rather than in the product-facing tree.
 
 For GPU-accelerated **snapshot construction** with native VSAG query and persistence,
 see [Build native HNSW snapshots with hipVS](bulk_hnsw_build.md). That opt-in path
-uses `SEEKDB_HIPVS_BUILD_WORKER`; it has separate build-time evidence and benchmarks.
+automatically discovers its worker next to seekdb; `SEEKDB_HIPVS_BUILD_WORKER`
+is an optional override. It has separate build-time evidence and benchmarks.
 See the [2026-10-29 construction experiment report](bulk_hnsw_experiment_2026-10-29.md)
 for repeated end-to-end measurements, recall checks and GPU execution evidence.
-The lazy GPU query path described below remains the default when the worker is not configured.
+The lazy GPU query path described below is retained when no worker is available
+or `SEEKDB_HIPVS_BUILD_WORKER` is explicitly set to an empty value.
 
 The backend adds optional hipVS/cuVS acceleration behind seekdb's existing
 vector adaptor. It does not replace VSAG globally.
 
-- GPU support is compiled only with `OB_BUILD_CUVS=ON`; the default is `OFF`.
+- GPU support requires `OB_BUILD_CUVS=ON`. The complete preinstalled competition
+  image is auto-detected; other environments default to `OFF`. Explicit `OFF`
+  always wins. No GPU toolkit or library is downloaded by detection.
 - A dense L2 HNSW/HGRAPH index opts in with `WITH (lib=cuvs)`.
 - `lib=vsag` indexes keep their existing CPU behavior.
 - Cosine and inner-product metrics are rejected for `lib=cuvs` at DDL time.

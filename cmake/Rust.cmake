@@ -62,6 +62,7 @@ endif()
 file(GLOB_RECURSE _rust_sources CONFIGURE_DEPENDS "${RUST_CRATE_DIR}/src/*.rs")
 list(APPEND _rust_sources
   "${RUST_WORKSPACE_DIR}/Cargo.toml"
+  "${RUST_WORKSPACE_DIR}/Cargo.lock"
   "${RUST_WORKSPACE_DIR}/rust-toolchain.toml"
   "${RUST_CRATE_DIR}/Cargo.toml")
 
@@ -71,6 +72,12 @@ list(APPEND _rust_sources
 # discovers on PATH.
 set(_rust_build_env "CARGO_TARGET_DIR=${RUST_TARGET_DIR}"
                     "CC=${CMAKE_C_COMPILER}" "AR=${CMAKE_AR}")
+set(_rust_lock_flags --locked)
+if(SEEKDB_OFFLINE_BUILD)
+  list(APPEND _rust_lock_flags --offline)
+  list(APPEND _rust_build_env "CARGO_NET_OFFLINE=true")
+  message(STATUS "[rust] locked offline build; missing cached dependencies fail without download")
+endif()
 if(WIN32)
   # rustup treats an exact-version override and the stable alias as distinct
   # installed toolchains, even when stable currently is that exact version.
@@ -114,7 +121,7 @@ endif()
 add_custom_command(
   OUTPUT "${RUST_STATICLIB}"
   COMMAND "${CMAKE_COMMAND}" -E env ${_rust_build_env}
-          "${CARGO}" build ${_cargo_profile_flag}
+          "${CARGO}" build ${_cargo_profile_flag} ${_rust_lock_flags}
           --manifest-path "${RUST_WORKSPACE_DIR}/Cargo.toml"
           --package sql-nio
   WORKING_DIRECTORY "${RUST_WORKSPACE_DIR}"

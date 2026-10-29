@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import pymysql
+from mysql_client import pymysql
 from benchmark import load_dataset, run_round
 from metrics import score_results, write_json
 
