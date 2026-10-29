@@ -1130,6 +1130,11 @@ typedef enum ObItemType
   T_TABLE_COLLECTION_EXPRESSION = 3460,
   T_DIAGNOSTICS = 3461,
   T_JSON_TABLE_EXPRESSION = 3462,
+  T_FILE_TABLE_EXPRESSION = 9000,  // read_csv/read_json/read_parquet/glob
+  T_FILE_TABLE_ARG = 9001,         // one named argument of a file table function
+  T_COPY_TABLE_STMT = 9002,        // COPY ... TO
+  T_COPY_OPTION = 9004,            // one option of COPY ... TO (...)
+  T_DESCRIBE_SELECT_STMT = 9003,   // DESCRIBE SELECT ...
   T_JSON_TABLE_COLUMN = 3463,
   //pseudo_column
   T_PSEUDO_COLUMN = 3464,
