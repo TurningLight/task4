@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_del_upd_resolver.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
 #include "sql/resolver/dml/ob_update_stmt.h"
 #include "sql/resolver/dml/ob_insert_stmt.h"
@@ -116,6 +117,33 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
           } else {
             if (OB_FAIL(check_same_base_table(*table, *ref_expr))) {
             }
+          }
+        }
+      }
+      // The value of an AI column is maintained by the system, business SQL may read it but
+      // must not assign it.  An explicit DEFAULT (or NULL in an INSERT) is accepted, it means
+      // "no value", which is exactly the state before the derivation completes.
+      // The check is ancillary: a schema lookup that does not succeed simply disables it.
+      if (OB_SUCC(ret) && OB_NOT_NULL(table)) {
+        const ObTableSchema *table_schema = NULL;
+        const ObColumnSchemaV2 *column_schema = NULL;
+        // ref_expr still carries the placeholder table id here, the real one is ref_id_
+        int tmp_ret = params_.schema_checker_->get_table_schema(table->ref_id_, table_schema);
+        if (OB_SUCCESS != tmp_ret || OB_ISNULL(table_schema)) {
+          // not resolvable here, nothing to check
+        } else {
+          column_schema = table_schema->get_column_schema(ref_expr->get_column_id());
+        }
+        if (OB_NOT_NULL(column_schema) && share::schema::ai_column::is_ai_column(*column_schema)
+            && (OB_ISNULL(params_.session_info_) || !params_.session_info_->is_inner())) {
+          if (T_DEFAULT == value_list.at(i)->get_expr_type()) {
+            // DEFAULT keeps the current derived value
+          } else if (T_INSERT_SCOPE == scope && T_NULL == value_list.at(i)->get_expr_type()) {
+            // NULL means "not derived yet"
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI column, its value is derived by the system");
+            LOG_WARN("try to assign an AI column", K(ret), KPC(column_schema));
           }
         }
       }

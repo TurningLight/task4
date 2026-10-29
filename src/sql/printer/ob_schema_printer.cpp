@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "sql/printer/ob_schema_printer.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "share/ob_autoincrement_service.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 
@@ -141,6 +142,8 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
         // do nothing
       } else if (col->is_hidden()) {
         // do nothing
+      } else if (share::schema::ai_column::is_ai_state_column(*col)) {
+        // the internal state columns of an AI column are not part of the user definition
       } else {
         if (true == is_first_col) {
           is_first_col = false;
@@ -297,6 +300,17 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
         if (OB_SUCC(ret) && 0 < strlen(col->get_comment())) {
           if (OB_FAIL(databuff_print_multi_objs(buf, buf_len, pos,
               " COMMENT '", ObHexEscapeSqlStr(col->get_comment_str()), "'"))) {
+          }
+        }
+        if (OB_SUCC(ret) && share::schema::ai_column::is_ai_column(*col)) {
+          share::schema::ai_column::ObAIColumnDef ai_def;
+          if (OB_FAIL(share::schema::ai_column::get_ai_column_def(*col, ai_def))) {
+            SHARE_SCHEMA_LOG(WARN, "fail to get ai column definition", K(ret), KPC(col));
+          } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, " AI COLUMN (%.*s) WITH (sync_mode='%.*s'",
+                    ai_def.expr_.length(), ai_def.expr_.ptr(),
+                    ai_def.sync_mode_.length(), ai_def.sync_mode_.ptr()))) {
+          } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ", max_retries=%ld)",
+                    ai_def.max_retries_))) {
           }
         }
         if (OB_SUCC(ret) && col->get_skip_index_attr().has_skip_index()) {

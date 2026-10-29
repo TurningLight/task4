@@ -1045,15 +1045,25 @@ int ObSchemaRetrieveUtils::fill_column_schema(const bool check_deleted, T &resul
       ret = fill_column_schema_default_value<T>(result, column, default_type);
     }
 
-    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection())) {
+    if (OB_SUCC(ret)) {
+      // enum/set and collection columns always carry the field; an AI column only does when
+      // it describes a derivation, so an empty value is tolerated for other types.
       ObString extend_type_info;
-      EXTRACT_VARCHAR_FIELD_MYSQL(result, "extended_type_info", extend_type_info);
+      ObString default_type_info = ObString::make_string("");
+      EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "extended_type_info",
+                                                     extend_type_info, true, true,
+                                                     default_type_info);
       int64_t pos = 0;
-      if (extend_type_info.empty()) {
-        ret = OB_ERR_UNEXPECTED;
-        SHARE_SCHEMA_LOG(WARN, "extend_type_info is empty", K(ret));
-      } else if (OB_FAIL(column.deserialize_extended_type_info(extend_type_info.ptr(), extend_type_info.length(), pos))) {
-      } else {}
+      if (OB_SUCC(ret) && extend_type_info.empty()) {
+        if (column.is_enum_or_set() || column.is_collection()) {
+          ret = OB_ERR_UNEXPECTED;
+          SHARE_SCHEMA_LOG(WARN, "extend_type_info is empty", K(ret));
+        }
+      } else if (OB_SUCC(ret)
+                 && OB_FAIL(column.deserialize_extended_type_info(extend_type_info.ptr(),
+                                                                  extend_type_info.length(),
+                                                                  pos))) {
+      }
     }
 
     if (OB_SUCC(ret) && column.is_generated_column()) {

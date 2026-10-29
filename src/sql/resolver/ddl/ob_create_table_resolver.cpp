@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -891,6 +892,55 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         } else {
           ObColumnNameHashWrapper name_key(hidden_col.get_column_name_str());
           if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+          }
+        }
+      }
+    }
+
+    // Every AI column owns three internal state columns:
+    //   __ai_chk_<col>  stored generated column, fingerprint of the derivation inputs
+    //   __ai_done_<col> fingerprint the stored value was produced from
+    //   __ai_err_<col>  failure message of the last attempt
+    // They live in the same table, so the derivation state is read and written inside the
+    // same transaction as the row itself, and a rollback rolls it back together with the row.
+    if (OB_SUCC(ret) && share::schema::ai_column::table_has_ai_column(table_schema)) {
+      ObSEArray<ObString, 4> ai_column_names;
+      ObSEArray<share::schema::ai_column::ObAIColumnDef, 4> ai_column_defs;
+      for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+           OB_SUCC(ret) && iter != table_schema.column_end(); ++iter) {
+        const ObColumnSchemaV2 *ai_column_schema = *iter;
+        share::schema::ai_column::ObAIColumnDef ai_def;
+        if (OB_ISNULL(ai_column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (!share::schema::ai_column::is_ai_column(*ai_column_schema)) {
+          // a regular column
+        } else if (OB_FAIL(share::schema::ai_column::get_ai_column_def(*ai_column_schema, ai_def))) {
+        } else if (OB_FAIL(ai_column_names.push_back(ai_column_schema->get_column_name_str()))) {
+        } else if (OB_FAIL(ai_column_defs.push_back(ai_def))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_names.count(); ++i) {
+        const ObColumnSchemaV2 *ai_column_schema = table_schema.get_column_schema(ai_column_names.at(i));
+        if (OB_ISNULL(ai_column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+        }
+        for (int64_t kind = share::schema::ai_column::AI_STATE_FINGERPRINT;
+             OB_SUCC(ret) && kind <= share::schema::ai_column::AI_STATE_ERROR; ++kind) {
+          ObColumnSchemaV2 state_column;
+          if (OB_FAIL(share::schema::ai_column::init_ai_state_column_schema(
+                  *allocator_, *ai_column_schema, ai_column_defs.at(i), kind,
+                  gen_column_id(), state_column))) {
+          } else if (OB_FAIL(table_schema.add_column(state_column))) {
+          } else {
+            const ObColumnSchemaV2 *added_column =
+                table_schema.get_column_schema(state_column.get_column_id());
+            if (OB_ISNULL(added_column)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              ObColumnNameHashWrapper name_key(added_column->get_column_name_str());
+              if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+              }
+            }
           }
         }
       }

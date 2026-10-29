@@ -23,6 +23,7 @@
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 #include "sql/resolver/ob_resolver_utils.h"
+#include "share/schema/ob_ai_column_utils.h"
 #include "sql/code_generator/ob_column_index_provider.h"
 #include "query/resolver/ob_partition_type_policy.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
@@ -3539,11 +3540,27 @@ int ObResolverUtils::generate_subschema_id(ObSQLSessionInfo &session_info,
                                            uint16_t &subschema_id)
 {
   int ret = OB_SUCCESS;
+  // An AI vector column keeps the description of its derivation in the same array, only the
+  // entry that describes the type takes part in the subschema id.
+  const ObString *type_info = NULL;
+  int64_t type_info_cnt = 0;
+  for (int64_t i = 0; i < extended_type_info.count(); ++i) {
+    if (share::schema::ai_column::starts_with(extended_type_info.at(i),
+                                              share::schema::ai_column::AI_META_MAGIC)) {
+      // not a type description
+    } else {
+      ++type_info_cnt;
+      if (NULL == type_info) {
+        type_info = &extended_type_info.at(i);
+      }
+    }
+  }
   if (OB_ISNULL(session_info.get_cur_exec_ctx())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (extended_type_info.count() != 1) {
+  } else if (1 != type_info_cnt || NULL == type_info) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(session_info.get_cur_exec_ctx()->get_subschema_id_by_type_string(extended_type_info.at(0), subschema_id))) {
+  } else if (OB_FAIL(session_info.get_cur_exec_ctx()->get_subschema_id_by_type_string(
+                       *type_info, subschema_id))) {
   }
   return ret;
 }

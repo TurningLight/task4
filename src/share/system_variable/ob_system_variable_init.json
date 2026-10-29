@@ -10975,5 +10975,18 @@
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10754,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "When enabled, a statement that reads an AI column raises an error if the column still has rows whose derived value is not ready (PENDING or FAILED), instead of returning NULL for them.",
+    "flags": "GLOBAL | SESSION",
+    "publish_version": "1.0.0.0",
+    "info_cn": "严格读取 AI 列：语句引用尚未全部就绪的 AI 列时报错",
+    "background_cn": "",
+    "ref_url": ""
   }
 }
