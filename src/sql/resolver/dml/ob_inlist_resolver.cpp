@@ -279,7 +279,7 @@ int ObInListResolver::check_inlist_rewrite_threshold(const ParseNode &in_list,
   if (is_enable && threshold > 1 && OB_NOT_NULL(in_list.children_)) {
     hash::ObHashSet<int64_t, hash::NoPthreadDefendMode> distinct;
     bool supported = true;
-    if (OB_FAIL(distinct.create(threshold, ObModIds::OB_SQL_COMPILE))) {
+    if (OB_FAIL(distinct.create(threshold, ObModIds::OB_SQL_COMPILE, ObModIds::OB_SQL_COMPILE))) {
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && supported && distinct.size() < threshold
            && i < in_list.num_child_; ++i) {
