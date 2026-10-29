@@ -218,19 +218,64 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   return ret;
 }
 
+namespace
+{
+// 线程内缓存 TOKENIZE 参数归一化结果：同一条 SQL / 同一批文档反复调用时输入完全一样，
+// 但原实现每次都重新解析 JSON、重新生成 parser 名并分配内存。
+struct ObFTTokenizeParamCache
+{
+  static const int64_t NAME_CAP = 64;
+  static const int64_t PROP_CAP = 1024;
+  char in_name_[NAME_CAP];
+  int64_t in_name_len_;
+  char in_prop_[PROP_CAP];
+  int64_t in_prop_len_;
+  char out_prop_[PROP_CAP];
+  int64_t out_prop_len_;
+  bool prop_valid_;
+  char out_name_[NAME_CAP];
+  int64_t out_name_len_;
+  bool name_valid_;
+  ObFTTokenizeParamCache()
+      : in_name_len_(0), in_prop_len_(0), out_prop_len_(0), prop_valid_(false),
+        out_name_len_(0), name_valid_(false)
+  {}
+};
+thread_local ObFTTokenizeParamCache g_ft_tokenize_param_cache;
+}  // namespace
+
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
+  ObFTTokenizeParamCache &cache = g_ft_tokenize_param_cache;
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  const int64_t in_len = input_str.length();
+  const bool cacheable = in_len <= ObFTTokenizeParamCache::NAME_CAP;
+  bool hit = cacheable && cache.name_valid_ && cache.in_name_len_ == in_len
+             && (0 == in_len || 0 == MEMCMP(cache.in_name_, input_str.ptr(), in_len));
+
+  if (hit) {
+    param.parser_name_ = ObString(static_cast<int32_t>(cache.out_name_len_), cache.out_name_);
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    char *parser_name_buf = nullptr;
+    if (OB_ISNULL(parser_name_buf
+                  = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+    } else {
+      param.parser_name_ = ObString::make_string(parser_name_buf);
+      if (cacheable && param.parser_name_.length() <= ObFTTokenizeParamCache::NAME_CAP) {
+        if (in_len > 0) {
+          MEMCPY(cache.in_name_, input_str.ptr(), in_len);
+        }
+        cache.in_name_len_ = in_len;
+        MEMCPY(cache.out_name_, param.parser_name_.ptr(), param.parser_name_.length());
+        cache.out_name_len_ = param.parser_name_.length();
+        cache.name_valid_ = true;
+      }
+    }
   }
   return ret;
 }
@@ -375,15 +420,46 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
+  ObFTTokenizeParamCache &cache = g_ft_tokenize_param_cache;
 
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  const int64_t name_len = parser_name_.length();
+  const int64_t prop_len = properties.length();
+  const bool cacheable = name_len <= ObFTTokenizeParamCache::NAME_CAP
+                         && prop_len <= ObFTTokenizeParamCache::PROP_CAP;
+  bool hit = false;
+  if (cacheable && cache.prop_valid_
+      && cache.in_name_len_ == name_len
+      && cache.in_prop_len_ == prop_len) {
+    hit = (0 == name_len || 0 == MEMCMP(cache.in_name_, parser_name_.ptr(), name_len))
+          && (0 == prop_len || 0 == MEMCMP(cache.in_prop_, properties.ptr(), prop_len));
+  }
+
+  if (hit) {
+    properties_ = ObString(static_cast<int32_t>(cache.out_prop_len_), cache.out_prop_);
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else if (cacheable && properties_.length() <= ObFTTokenizeParamCache::PROP_CAP) {
+      if (name_len > 0) {
+        MEMCPY(cache.in_name_, parser_name_.ptr(), name_len);
+      }
+      cache.in_name_len_ = name_len;
+      if (prop_len > 0) {
+        MEMCPY(cache.in_prop_, properties.ptr(), prop_len);
+      }
+      cache.in_prop_len_ = prop_len;
+      if (properties_.length() > 0) {
+        MEMCPY(cache.out_prop_, properties_.ptr(), properties_.length());
+      }
+      cache.out_prop_len_ = properties_.length();
+      cache.prop_valid_ = true;
+    }
   }
 
   return ret;
