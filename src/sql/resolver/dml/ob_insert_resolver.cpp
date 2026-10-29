@@ -120,7 +120,8 @@ int ObInsertResolver::resolve(const ParseNode &parse_tree)
         } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(
                                value_desc.at(i)->get_column_id()))) {
           // a generated table column, nothing to check here
-        } else if (share::schema::ai_column::is_ai_column(*column_schema)) {
+        } else if (share::schema::ai_column::is_ai_column(*column_schema)
+                   && (OB_ISNULL(session_info_) || !session_info_->is_inner())) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI column, its value is derived by the system");
           LOG_WARN("try to insert into an AI column", K(ret), KPC(column_schema));

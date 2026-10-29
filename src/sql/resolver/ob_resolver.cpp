@@ -18,6 +18,7 @@
 #include "sql/resolver/ob_resolver.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
 #include "query/session/ob_session_inner_sql.h"
+#include "sql/parser/ob_parser.h"
 #include "share/schema/ob_ai_column_utils.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -273,6 +274,121 @@ int check_ai_column_strict_read(ObResolverParams &params, ObDMLStmt &stmt)
 
 } // anonymous namespace
 
+
+namespace ai_column_retry
+{
+
+// ALTER TABLE t RETRY AI COLUMN c [WHERE status = 'FAILED'] puts the failed rows of an AI
+// column back into the pending state so that the background worker derives them again.
+// It is executed as an update of the derived state columns, which keeps the statement
+// immediately consistent with the data and needs no DDL job.
+inline bool is_retry_stmt(const ParseNode &node)
+{
+  // ALTER TABLE t RETRY AI COLUMN c [WHERE ...] is the only alter table form with three
+  // children: the relation, the AI column and the optional retry condition.
+  return T_ALTER_TABLE == node.type_ && 3 == node.num_child_ && OB_NOT_NULL(node.children_[1]);
+}
+
+int append_identifier(ObSqlString &sql, const ObString &name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("`"))) {
+  } else if (OB_FAIL(sql.append(name))) {
+  } else if (OB_FAIL(sql.append("`"))) {
+  }
+  return ret;
+}
+
+int build_retry_sql(const ParseNode &node, ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *relation = node.children_[0];
+  ParseNode *ai_column = node.children_[1];
+  ParseNode *where = node.children_[2];
+  ObString db_name;
+  ObString table_name;
+  ObString column_name;
+  if (OB_ISNULL(relation) || 3 != relation->num_child_ || OB_ISNULL(relation->children_[1])
+      || OB_ISNULL(ai_column)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_NOT_NULL(relation->children_[0])) {
+    db_name.assign_ptr(relation->children_[0]->str_value_, relation->children_[0]->str_len_);
+  }
+  if (OB_SUCC(ret)) {
+    table_name.assign_ptr(relation->children_[1]->str_value_, relation->children_[1]->str_len_);
+    column_name.assign_ptr(ai_column->str_value_, ai_column->str_len_);
+    if (!table_name.empty() && !column_name.empty()) {
+      // the only meaningful retry condition is the failed state
+      if (OB_NOT_NULL(where)) {
+        ObString pseudo_column;
+        ObString status_value;
+        if (2 != where->num_child_ || OB_ISNULL(where->children_[0])
+            || OB_ISNULL(where->children_[1])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          pseudo_column.assign_ptr(where->children_[0]->str_value_,
+                                   where->children_[0]->str_len_);
+          status_value.assign_ptr(where->children_[1]->str_value_,
+                                  where->children_[1]->str_len_);
+          if (0 != pseudo_column.case_compare("status")
+              || 0 != status_value.case_compare("FAILED")) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "the AI column retry condition, only status = 'FAILED' is supported");
+            LOG_WARN("unsupported AI column retry condition", K(ret), K(pseudo_column),
+                     K(status_value));
+          }
+        }
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObSqlString err_column;
+    if (OB_FAIL(err_column.append(share::schema::ai_column::AI_ERR_PREFIX))) {
+    } else if (OB_FAIL(err_column.append(column_name))) {
+    } else if (OB_FAIL(sql.append("update "))) {
+    } else if (!db_name.empty()) {
+      if (OB_FAIL(append_identifier(sql, db_name))) {
+      } else if (OB_FAIL(sql.append("."))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(append_identifier(sql, table_name))) {
+      } else if (OB_FAIL(sql.append(" set "))) {
+      } else if (OB_FAIL(append_identifier(sql, err_column.string()))) {
+      } else if (OB_FAIL(sql.append(" = null where "))) {
+      } else if (OB_FAIL(append_identifier(sql, err_column.string()))) {
+      } else if (OB_FAIL(sql.append(" is not null"))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// Rewrites the statement into the update described above; the caller resolves the result.
+int rewrite(const ParseNode &node, ObResolverParams &params, ParseResult &result)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  if (OB_ISNULL(params.allocator_) || OB_ISNULL(params.session_info_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(build_retry_sql(node, sql))) {
+  } else {
+    ObParser parser(*params.allocator_, params.session_info_->get_sql_mode(),
+                    params.session_info_->get_charsets4parser());
+    if (OB_FAIL(parser.parse(sql.string(), result, STD_MODE))) {
+      LOG_WARN("[AI-COLUMN] failed to parse the rewritten retry statement", K(ret));
+    } else if (OB_ISNULL(result.result_tree_)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  return ret;
+}
+
+} // namespace ai_column_retry
+
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
 #define REGISTER_STMT_RESOLVER(name)                                   \
@@ -287,8 +403,10 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_resolve);
   int ret = OB_SUCCESS;
   const ParseNode *real_parse_tree = NULL;
+  ParseResult ai_column_retry_result;
   int64_t questionmark_count = 0;
   UNUSED(if_prepared);
+  MEMSET(&ai_column_retry_result, 0, sizeof(ai_column_retry_result));
   if (OB_ISNULL(params_.allocator_)
       || OB_ISNULL(params_.schema_checker_)
       || OB_ISNULL(params_.session_info_)
@@ -297,18 +415,36 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
     ret = OB_NOT_INIT;
   } else {
     real_parse_tree = &parse_tree;
+    // ALTER TABLE t RETRY AI COLUMN c is resolved as an update of the derived state columns
+    if (ai_column_retry::is_retry_stmt(parse_tree)) {
+      if (OB_FAIL(ai_column_retry::rewrite(parse_tree, params_, ai_column_retry_result))) {
+      } else {
+        // the parser returns a statement list, the statement itself is its first child
+        ParseNode *retry_tree = ai_column_retry_result.result_tree_;
+        if (OB_NOT_NULL(retry_tree) && T_STMT_LIST == retry_tree->type_
+            && retry_tree->num_child_ > 0) {
+          retry_tree = retry_tree->children_[0];
+        }
+        if (OB_ISNULL(retry_tree) || T_UPDATE != retry_tree->type_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[AI-COLUMN] the retry statement was not rewritten as an update", K(ret));
+        } else {
+          real_parse_tree = retry_tree;
+        }
+      }
+    }
   }
 
   if (OB_SUCC(ret)) {
-    params_.resolver_scope_stmt_type_ = parse_tree.type_;
+    params_.resolver_scope_stmt_type_ = real_parse_tree->type_;
     params_.session_info_->set_stmt_type(
-      ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_));
+      ObResolverUtils::get_stmt_type_by_item_type(real_parse_tree->type_));
     ObExecContext *exec_ctx = params_.session_info_->get_cur_exec_ctx();
     if (exec_ctx != nullptr && exec_ctx->get_sql_ctx() != nullptr) {
       //save the current stmt type on my context,
       //some other modules may need to get the current SQL stmt type through its context
       ObSqlCtx *sql_ctx = exec_ctx->get_sql_ctx();
-      sql_ctx->stmt_type_ = ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_);
+      sql_ctx->stmt_type_ = ObResolverUtils::get_stmt_type_by_item_type(real_parse_tree->type_);
     }
 
     switch (real_parse_tree->type_) {

@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SERVER_OMT
 
 
+#include <atomic>
 #include "share/ob_server_struct.h"
 #include "config_bridge.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -68,6 +69,11 @@
 #include "observer/change_stream/ob_change_stream_mgr.h"
 #include "share/roaringbitmap/ob_rb_memory_mgr.h"
 #include "sql/dtl/ob_dtl_interm_result_manager.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/ob_shared_timer.h"
+#include "share/schema/ob_ai_column_utils.h"
+#include "share/schema/ob_schema_getter_guard.h"
 #include "sql/session/ob_sql_session_mgr.h"
 #include "observer/omt/ob_ai_service.h"
 #include "storage/allocator/ob_memstore_allocator.h"  // relocated-definition owner
@@ -1485,6 +1491,449 @@ int ObServer::obs_init_modules()
   return ret;
 }
 
+
+// ---------------------------- AI column background worker ----------------------------
+//
+// An AI column definition only describes how its value is derived; the derivation itself is
+// asynchronous.  This worker periodically looks for rows whose input fingerprint moved away
+// from the fingerprint their value was produced from (PENDING), derives the value by simply
+// re-evaluating the AI expression inside an UPDATE, and records the outcome in the state
+// columns of the row:
+//
+//   UPDATE t SET <ai column> = <ai expression>, __ai_done_x = __ai_chk_x, __ai_err_x = NULL
+//    WHERE <primary key> = ... AND __ai_chk_x = '<fingerprint the work was planned from>'
+//
+// The fingerprint guard makes the write a compare-and-set: a result computed from an older
+// input can never overwrite the result of a newer one.  A row whose derivation fails is marked
+// with the error message and is skipped until ALTER TABLE ... RETRY AI COLUMN resets it.
+namespace ai_column_worker
+{
+
+const int64_t AI_COLUMN_WORK_INTERVAL_US = 1000L * 1000L; // one pass per second
+const int64_t AI_COLUMN_WORK_MAX_ROWS = 8;                // rows per AI column per pass
+
+int append_identifier(common::ObSqlString &sql, const common::ObString &name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("`"))) {
+  } else if (OB_FAIL(sql.append(name))) {
+  } else if (OB_FAIL(sql.append("`"))) {
+  }
+  return ret;
+}
+
+int append_string_literal(common::ObSqlString &sql, const common::ObString &value)
+{
+  int ret = OB_SUCCESS;
+  const char *ptr = value.ptr();
+  if (OB_FAIL(sql.append("'"))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    if ('\'' == ptr[i]) {
+      if (OB_FAIL(sql.append("''"))) {
+      }
+    } else if ('\\' == ptr[i]) {
+      if (OB_FAIL(sql.append("\\\\"))) {
+      }
+    } else if (OB_FAIL(sql.append(ptr + i, 1))) {
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(sql.append("'"))) {
+  }
+  return ret;
+}
+
+int append_table_name(common::ObSqlString &sql,
+                      const common::ObString &db_name,
+                      const common::ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(append_identifier(sql, db_name))) {
+  } else if (OB_FAIL(sql.append("."))) {
+  } else if (OB_FAIL(append_identifier(sql, table_name))) {
+  }
+  return ret;
+}
+
+class ObAIColumnWorkTask : public common::ObTimerTask
+{
+public:
+  ObAIColumnWorkTask() : in_progress_(false) {}
+  virtual ~ObAIColumnWorkTask() {}
+  virtual void runTimerTask() override;
+  int run_pass();
+private:
+  int process_table(const share::schema::ObTableSchema &table,
+                    const share::schema::ObDatabaseSchema &db_schema);
+  int process_column(const share::schema::ObTableSchema &table,
+                     const common::ObString &db_name,
+                     const share::schema::ObColumnSchemaV2 &ai_column);
+  int process_row(const share::schema::ObTableSchema &table,
+                  const common::ObString &db_name,
+                  const share::schema::ObColumnSchemaV2 &ai_column,
+                  const share::schema::ai_column::ObAIColumnDef &ai_def,
+                  const common::ObIArray<const share::schema::ObColumnSchemaV2 *> &rowkey_columns,
+                  const common::ObIArray<common::ObString> &rowkey_values,
+                  const common::ObString &done_name,
+                  const common::ObString &chk_name,
+                  const common::ObString &err_name,
+                  const common::ObString &fingerprint);
+  int build_row_filter(common::ObSqlString &sql,
+                       const common::ObIArray<const share::schema::ObColumnSchemaV2 *> &rowkey_columns,
+                       const common::ObIArray<common::ObString> &rowkey_values,
+                       const common::ObString &chk_name,
+                       const common::ObString &fingerprint);
+  int execute_update(const common::ObSqlString &sql, int64_t &affected_rows);
+  int execute_read(const common::ObSqlString &sql, common::ObMySQLProxy::MySQLResult &result);
+  std::atomic<bool> in_progress_;
+};
+
+ObAIColumnWorkTask &get_work_task()
+{
+  static ObAIColumnWorkTask task;
+  return task;
+}
+
+int start()
+{
+  int ret = OB_SUCCESS;
+  share::ObISharedTimer *timer =
+      ::oceanbase::share::server_service<::oceanbase::share::ObISharedTimer>();
+  if (OB_ISNULL(timer)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(timer->schedule(get_work_task(), AI_COLUMN_WORK_INTERVAL_US, true /*repeat*/))) {
+  } else {
+    get_work_task().disable_timeout_check();
+  }
+  return ret;
+}
+
+void stop()
+{
+  share::ObISharedTimer *timer =
+      ::oceanbase::share::server_service<::oceanbase::share::ObISharedTimer>();
+  if (OB_NOT_NULL(timer)) {
+    timer->cancel_task(get_work_task());
+    timer->wait_task(get_work_task());
+  }
+}
+
+void ObAIColumnWorkTask::runTimerTask()
+{
+  int ret = OB_SUCCESS;
+  bool expected = false;
+  if (!in_progress_.compare_exchange_strong(expected, true)) {
+    // the previous pass is still running, keep this one short
+  } else {
+    // an AI call may take a while: give this pass its own, generous budget
+    THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 120LL * 1000LL * 1000LL);
+    if (OB_FAIL(run_pass())) {
+      LOG_WARN("[AI-COLUMN] worker pass failed", K(ret));
+    }
+    in_progress_.store(false);
+  }
+}
+
+int ObAIColumnWorkTask::execute_update(const common::ObSqlString &sql, int64_t &affected_rows)
+{
+  int ret = OB_SUCCESS;
+  affected_rows = 0;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(GCTX.sql_proxy_->write(common::ObString(sql.length(), sql.ptr()),
+                                            affected_rows))) {
+    LOG_WARN("[AI-COLUMN] update failed", K(ret), K(sql));
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::execute_read(const common::ObSqlString &sql,
+                                     common::ObMySQLProxy::MySQLResult &result)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(GCTX.sql_proxy_->read(result, sql.ptr()))) {
+    LOG_WARN("[AI-COLUMN] read failed", K(ret), K(sql));
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::run_pass()
+{
+  int ret = OB_SUCCESS;
+  share::schema::ObSchemaGetterGuard guard;
+  common::ObSEArray<const share::schema::ObTableSchema *, 16> tables;
+  if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
+  } else if (OB_FAIL(guard.get_table_schemas_in_runtime(tables))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+      const share::schema::ObTableSchema *table = tables.at(i);
+      const share::schema::ObDatabaseSchema *db_schema = NULL;
+      int tmp_ret = OB_SUCCESS;
+      if (OB_ISNULL(table)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!table->is_user_table()) {
+        // system tables do not own AI columns
+      } else if (!share::schema::ai_column::table_has_ai_column(*table)) {
+        // nothing to derive
+      } else if (OB_FAIL(guard.get_database_schema(table->get_database_id(), db_schema))) {
+      } else if (OB_ISNULL(db_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_TMP_FAIL(process_table(*table, *db_schema))) {
+        LOG_WARN("[AI-COLUMN] failed to process a table", K(tmp_ret),
+                 K(table->get_table_name_str()));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::process_table(const share::schema::ObTableSchema &table,
+                                      const share::schema::ObDatabaseSchema &db_schema)
+{
+  int ret = OB_SUCCESS;
+  common::ObSEArray<const share::schema::ObColumnSchemaV2 *, 8> ai_columns;
+  if (OB_FAIL(share::schema::ai_column::get_ai_columns(table, ai_columns))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_ISNULL(ai_columns.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_TMP_FAIL(process_column(table,
+                                            db_schema.get_database_name_str(),
+                                            *ai_columns.at(i)))) {
+        LOG_WARN("[AI-COLUMN] failed to process an AI column", K(tmp_ret),
+                 K(table.get_table_name_str()), K(ai_columns.at(i)->get_column_name_str()));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::build_row_filter(
+    common::ObSqlString &sql,
+    const common::ObIArray<const share::schema::ObColumnSchemaV2 *> &rowkey_columns,
+    const common::ObIArray<common::ObString> &rowkey_values,
+    const common::ObString &chk_name,
+    const common::ObString &fingerprint)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_columns.count(); ++i) {
+    if (i > 0 && OB_FAIL(sql.append(" and "))) {
+    } else if (OB_FAIL(append_identifier(sql, rowkey_columns.at(i)->get_column_name_str()))) {
+    } else if (OB_FAIL(sql.append(" = "))) {
+    } else if (OB_FAIL(append_string_literal(sql, rowkey_values.at(i)))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(sql.append(" and "))) {
+    } else if (OB_FAIL(append_identifier(sql, chk_name))) {
+    } else if (OB_FAIL(sql.append(" = "))) {
+    } else if (OB_FAIL(append_string_literal(sql, fingerprint))) {
+    }
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::process_row(
+    const share::schema::ObTableSchema &table,
+    const common::ObString &db_name,
+    const share::schema::ObColumnSchemaV2 &ai_column,
+    const share::schema::ai_column::ObAIColumnDef &ai_def,
+    const common::ObIArray<const share::schema::ObColumnSchemaV2 *> &rowkey_columns,
+    const common::ObIArray<common::ObString> &rowkey_values,
+    const common::ObString &done_name,
+    const common::ObString &chk_name,
+    const common::ObString &err_name,
+    const common::ObString &fingerprint)
+{
+  int ret = OB_SUCCESS;
+  int last_error = OB_SUCCESS;
+  int64_t max_attempts = ai_def.max_retries_ + 1;
+  if (max_attempts <= 0) {
+    max_attempts = 1;
+  }
+  for (int64_t attempt = 0; OB_SUCC(ret) && attempt < max_attempts; ++attempt) {
+    common::ObSqlString sql;
+    int64_t affected_rows = 0;
+    int tmp_ret = OB_SUCCESS;
+    if (OB_FAIL(sql.append("update "))) {
+    } else if (OB_FAIL(append_table_name(sql, db_name, table.get_table_name_str()))) {
+    } else if (OB_FAIL(sql.append(" set "))) {
+    } else if (OB_FAIL(append_identifier(sql, ai_column.get_column_name_str()))) {
+    } else if (OB_FAIL(sql.append(" = "))) {
+    } else if (OB_FAIL(sql.append(ai_def.expr_))) {
+    } else if (OB_FAIL(sql.append(", "))) {
+    } else if (OB_FAIL(append_identifier(sql, done_name))) {
+    } else if (OB_FAIL(sql.append(" = "))) {
+    } else if (OB_FAIL(append_identifier(sql, chk_name))) {
+    } else if (OB_FAIL(sql.append(", "))) {
+    } else if (OB_FAIL(append_identifier(sql, err_name))) {
+    } else if (OB_FAIL(sql.append(" = null where "))) {
+    } else if (OB_FAIL(build_row_filter(sql, rowkey_columns, rowkey_values, chk_name,
+                                        fingerprint))) {
+    } else if (OB_TMP_FAIL(execute_update(sql, affected_rows))) {
+      last_error = tmp_ret;
+      LOG_WARN("[AI-COLUMN] derivation attempt failed", K(tmp_ret), K(attempt),
+               K(table.get_table_name_str()), K(ai_column.get_column_name_str()));
+    } else {
+      if (affected_rows > 0) {
+        LOG_INFO("[AI-COLUMN] derived a value", K(table.get_table_name_str()),
+                 K(ai_column.get_column_name_str()), K(fingerprint));
+      } else {
+        // the row changed after the work was planned: this result is stale and must not be
+        // written back, a newer pass will derive the new input
+        LOG_INFO("[AI-COLUMN] skip stale work", K(table.get_table_name_str()),
+                 K(ai_column.get_column_name_str()), K(fingerprint));
+      }
+      break;
+    }
+  }
+  if (OB_SUCC(ret) && OB_SUCCESS != last_error) {
+    // record the failure on the row, guarded by the same fingerprint
+    common::ObSqlString fail_sql;
+    int64_t affected_rows = 0;
+    char err_buf[256];
+    const int64_t err_len = snprintf(err_buf, sizeof(err_buf),
+                                     "ai column derivation failed, error code %d", last_error);
+    common::ObString err_msg(err_len > 0 ? static_cast<int32_t>(err_len) : 0, err_buf);
+    int tmp_ret = OB_SUCCESS;
+    if (OB_FAIL(fail_sql.append("update "))) {
+    } else if (OB_FAIL(append_table_name(fail_sql, db_name, table.get_table_name_str()))) {
+    } else if (OB_FAIL(fail_sql.append(" set "))) {
+    } else if (OB_FAIL(append_identifier(fail_sql, err_name))) {
+    } else if (OB_FAIL(fail_sql.append(" = "))) {
+    } else if (OB_FAIL(append_string_literal(fail_sql, err_msg))) {
+    } else if (OB_FAIL(fail_sql.append(" where "))) {
+    } else if (OB_FAIL(build_row_filter(fail_sql, rowkey_columns, rowkey_values, chk_name,
+                                        fingerprint))) {
+    } else if (OB_TMP_FAIL(execute_update(fail_sql, affected_rows))) {
+      LOG_WARN("[AI-COLUMN] failed to record a derivation failure", K(tmp_ret),
+               K(table.get_table_name_str()));
+    }
+  }
+  return ret;
+}
+
+int ObAIColumnWorkTask::process_column(const share::schema::ObTableSchema &table,
+                                       const common::ObString &db_name,
+                                       const share::schema::ObColumnSchemaV2 &ai_column)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("AI-COLUMN");
+  share::schema::ai_column::ObAIColumnDef ai_def;
+  common::ObSEArray<const share::schema::ObColumnSchemaV2 *, 4> rowkey_columns;
+  common::ObString chk_name;
+  common::ObString done_name;
+  common::ObString err_name;
+  if (OB_FAIL(share::schema::ai_column::get_ai_column_def(ai_column, ai_def))) {
+  } else if (OB_FAIL(share::schema::ai_column::build_state_column_name(
+                 allocator, share::schema::ai_column::AI_STATE_FINGERPRINT,
+                 ai_column.get_column_name_str(), chk_name))) {
+  } else if (OB_FAIL(share::schema::ai_column::build_state_column_name(
+                 allocator, share::schema::ai_column::AI_STATE_DONE,
+                 ai_column.get_column_name_str(), done_name))) {
+  } else if (OB_FAIL(share::schema::ai_column::build_state_column_name(
+                 allocator, share::schema::ai_column::AI_STATE_ERROR,
+                 ai_column.get_column_name_str(), err_name))) {
+  } else {
+    for (share::schema::ObTableSchema::const_column_iterator iter = table.column_begin();
+         OB_SUCC(ret) && iter != table.column_end(); ++iter) {
+      const share::schema::ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_rowkey_column()) {
+        if (OB_FAIL(rowkey_columns.push_back(column))) {
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (rowkey_columns.empty()) {
+    // without an explicit primary key a single row cannot be addressed
+    LOG_DEBUG("[AI-COLUMN] skip an AI column of a table without a primary key",
+              K(table.get_table_name_str()));
+  } else {
+    common::ObSqlString sql;
+    if (OB_FAIL(sql.append("select "))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_columns.count(); ++i) {
+      char alias[32];
+      const int64_t alias_len = snprintf(alias, sizeof(alias), "pk%ld", i);
+      if (OB_FAIL(sql.append("cast("))) {
+      } else if (OB_FAIL(append_identifier(sql, rowkey_columns.at(i)->get_column_name_str()))) {
+      } else if (OB_FAIL(sql.append(" as char) as "))) {
+      } else if (OB_FAIL(sql.append(alias, alias_len))) {
+      } else if (OB_FAIL(sql.append(", "))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(sql.append("cast("))) {
+      } else if (OB_FAIL(append_identifier(sql, chk_name))) {
+      } else if (OB_FAIL(sql.append(" as char) as fp from "))) {
+      } else if (OB_FAIL(append_table_name(sql, db_name, table.get_table_name_str()))) {
+      } else if (OB_FAIL(sql.append(" where ("))) {
+      } else if (OB_FAIL(append_identifier(sql, done_name))) {
+      } else if (OB_FAIL(sql.append(" is null or "))) {
+      } else if (OB_FAIL(append_identifier(sql, done_name))) {
+      } else if (OB_FAIL(sql.append(" <> "))) {
+      } else if (OB_FAIL(append_identifier(sql, chk_name))) {
+      } else if (OB_FAIL(sql.append(") and "))) {
+      } else if (OB_FAIL(append_identifier(sql, err_name))) {
+      } else if (OB_FAIL(sql.append(" is null limit "))) {
+      } else if (OB_FAIL(sql.append_fmt("%ld", AI_COLUMN_WORK_MAX_ROWS))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      common::ObMySQLProxy::MySQLResult result;
+      if (OB_FAIL(execute_read(sql, result))) {
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        bool end = false;
+        while (OB_SUCC(ret) && !end) {
+          int next_ret = result.get_result()->next();
+          if (OB_ITER_END == next_ret) {
+            end = true;
+          } else if (OB_SUCCESS != next_ret) {
+            ret = next_ret;
+          } else {
+            common::ObSEArray<common::ObString, 4> rowkey_values;
+            common::ObString fingerprint;
+            for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_columns.count(); ++i) {
+              char alias[32];
+              const int64_t alias_len = snprintf(alias, sizeof(alias), "pk%ld", i);
+              UNUSED(alias_len);
+              common::ObString value;
+              if (OB_FAIL(result.get_result()->get_varchar(alias, value))) {
+                LOG_WARN("[AI-COLUMN] failed to read a primary key value", K(ret), K(i));
+              } else if (OB_FAIL(rowkey_values.push_back(value))) {
+              }
+            }
+            if (OB_SUCC(ret) && OB_FAIL(result.get_result()->get_varchar("fp", fingerprint))) {
+            }
+            if (OB_SUCC(ret)) {
+              int tmp_ret = process_row(table, db_name, ai_column, ai_def, rowkey_columns,
+                                        rowkey_values, done_name, chk_name, err_name,
+                                        fingerprint);
+              if (OB_SUCCESS != tmp_ret) {
+                LOG_WARN("[AI-COLUMN] failed to derive a row", K(tmp_ret),
+                         K(table.get_table_name_str()), K(ai_column.get_column_name_str()));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace ai_column_worker
+
 int ObServer::obs_start_modules()
 {
   int ret = OB_SUCCESS;
@@ -1519,12 +1968,14 @@ int ObServer::obs_start_modules()
   if (OB_SUCC(ret) && OB_FAIL(server_module_start_default(mods_rb_mem_mgr_))) { SERVER_LOG(WARN, "mods_rb_mem_mgr_ fail", KR(ret)); }
   if (OB_SUCC(ret) && OB_FAIL(server_module_start_default(mods_plugin_vector_index_service_))) { SERVER_LOG(WARN, "mods_plugin_vector_index_service_ fail", KR(ret)); }
   if (OB_SUCC(ret) && OB_FAIL(server_module_start_default(mods_ai_service_))) { SERVER_LOG(WARN, "mods_ai_service_ fail", KR(ret)); }
+  if (OB_SUCC(ret) && OB_FAIL(ai_column_worker::start())) { SERVER_LOG(WARN, "ai_column_worker fail", KR(ret)); }
   if (OB_SUCC(ret) && OB_FAIL(server_module_start_default(mods_change_stream_mgr_))) { SERVER_LOG(WARN, "mods_change_stream_mgr_ fail", KR(ret)); }
   return ret;
 }
 
 void ObServer::obs_stop_modules()
 {
+  ai_column_worker::stop();
   server_module_stop_default(mods_shared_macro_block_mgr_);
   server_module_stop_default(mods_change_stream_mgr_);
   server_module_stop_default(mods_ai_service_);

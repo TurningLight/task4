@@ -134,7 +134,8 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
         } else {
           column_schema = table_schema->get_column_schema(ref_expr->get_column_id());
         }
-        if (OB_NOT_NULL(column_schema) && share::schema::ai_column::is_ai_column(*column_schema)) {
+        if (OB_NOT_NULL(column_schema) && share::schema::ai_column::is_ai_column(*column_schema)
+            && (OB_ISNULL(params_.session_info_) || !params_.session_info_->is_inner())) {
           if (T_DEFAULT == value_list.at(i)->get_expr_type()) {
             // DEFAULT keeps the current derived value
           } else if (T_INSERT_SCOPE == scope && T_NULL == value_list.at(i)->get_expr_type()) {

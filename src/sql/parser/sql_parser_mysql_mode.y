@@ -259,6 +259,7 @@ END_P SET_VAR DELIMITER
 //-----------------------------reserved keyword end-------------------------------------------------
 %token <non_reserved_keyword>
 //-----------------------------non_reserved keyword begin-------------------------------------------
+        RETRY
         ACCESS ACCOUNT ACTION ACTIVE ADDDATE AFTER AGAINST AGGREGATE AI ALGORITHM ALWAYS ALLOW ANALYSE ANY
         APPROX_COUNT_DISTINCT APPROX_COUNT_DISTINCT_SYNOPSIS APPROX_COUNT_DISTINCT_SYNOPSIS_MERGE
         ARRAY ASCII ASIS AT ATTRIBUTE AUTHORS AUTO AUTOEXTEND_SIZE AUTO_INCREMENT AUTO_INCREMENT_CACHE_SIZE
@@ -422,6 +423,7 @@ END_P SET_VAR DELIMITER
 %type <node> int_or_decimal
 %type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
 %type <node> opt_ai_column_with_options ai_column_option_list ai_column_option
+%type <node> opt_ai_column_retry_where
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -14703,6 +14705,25 @@ alter_with_opt_hint TABLE relation_factor alter_table_actions
   merge_nodes(table_actions, result, T_ALTER_TABLE_ACTION_LIST, $4);
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE, 4, $3, table_actions, NULL, $1);
   $$->value_ = 0;
+}
+| alter_with_opt_hint TABLE relation_factor RETRY AI COLUMN column_name opt_ai_column_retry_where
+{
+  /* ALTER TABLE t RETRY AI COLUMN c [WHERE status = 'FAILED'] is executed as an update of
+   * the derived state columns of c, see ObResolver::resolve. */
+  (void)($1);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE, 3, $3, $7, $8);
+  $$->value_ = 2;
+}
+;
+
+opt_ai_column_retry_where:
+/*empty*/
+{
+  $$ = NULL;
+}
+| WHERE column_name COMP_EQ STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $2, $4);
 }
 ;
 
