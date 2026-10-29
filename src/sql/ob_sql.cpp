@@ -38,6 +38,13 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "share/ai_column/ob_ai_column_utils.h"
+#include "lib/string/ob_sql_string.h"
+#include "lib/allocator/page_arena.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "sql/session/ob_inner_sql_connection.h"
+#include "query/session/ob_inner_sql_connection_access.h"
 
 namespace oceanbase
 {
@@ -3158,6 +3165,356 @@ int ObSql::get_outline_data(ObPlanCacheCtx &pc_ctx,
   return ret;
 }
 
+// AI COLUMN declarations and `alter table ... retry ai column ...` are not part of the MySQL
+// grammar, they are rewritten into equivalent standard statements before parsing.
+namespace
+{
+
+bool aic_has_identifier(const ObIArray<ObString> &identifiers, const ObString &name)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < identifiers.count(); ++i) {
+    found = (0 == identifiers.at(i).case_compare(name));
+  }
+  return found;
+}
+
+bool aic_is_rowkey_column(const ObTableSchema &table_schema, const ObString &column_name)
+{
+  bool found = false;
+  ObSEArray<uint64_t, 4> rowkey_ids;
+  if (OB_SUCCESS == table_schema.get_rowkey_column_ids(rowkey_ids)) {
+    for (int64_t i = 0; !found && i < rowkey_ids.count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema.get_column_schema(rowkey_ids.at(i));
+      found = NULL != column && 0 == column->get_column_name_str().case_compare(column_name);
+    }
+  }
+  return found;
+}
+
+// Best effort schema lookup: a statement may name columns, aliases or functions, so a miss here
+// only means the word is not a table and never fails the statement.
+int aic_find_table(ObSchemaGetterGuard &guard,
+                   const ObString &database_name,
+                   const ObString &table_name,
+                   const ObTableSchema *&table_schema)
+{
+  int ret = OB_SUCCESS;
+  table_schema = NULL;
+  if (database_name.empty() || table_name.empty()) {
+  } else if (OB_FAIL(guard.get_table_schema(database_name, table_name, false, table_schema))) {
+    ret = OB_SUCCESS;
+    table_schema = NULL;
+  }
+  return ret;
+}
+
+// A table that holds AI columns, as referenced by the statement being analyzed.
+struct AiColumnTableRef
+{
+  AiColumnTableRef() : table_id_(OB_INVALID_ID) {}
+  uint64_t table_id_;
+  ObString database_name_;
+  ObString table_name_;
+};
+
+bool aic_has_table_ref(const ObIArray<AiColumnTableRef> &refs, const uint64_t table_id)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < refs.count(); ++i) {
+    found = refs.at(i).table_id_ == table_id;
+  }
+  return found;
+}
+
+// Reads one row from `select 1 from <t> where <c> is null limit 1` on the caller's transaction,
+// so a value invalidated earlier in the same transaction is already visible.
+int aic_has_pending_row(ObSQLSessionInfo &session,
+                        const ObString &database_name,
+                        const ObString &table_name,
+                        const ObString &column_name,
+                        bool &has_pending)
+{
+  int ret = OB_SUCCESS;
+  has_pending = false;
+  ObSqlString sql;
+  sqlclient::ObISQLConnectionGuard conn_guard;
+  ObIInnerSQLConnection *inner_conn = NULL;
+  if (OB_FAIL(sql.append("select 1 from `"))) {
+  } else if (OB_FAIL(sql.append(database_name))) {
+  } else if (OB_FAIL(sql.append("`.`"))) {
+  } else if (OB_FAIL(sql.append(table_name))) {
+  } else if (OB_FAIL(sql.append("` where `"))) {
+  } else if (OB_FAIL(sql.append(column_name))) {
+  } else if (OB_FAIL(sql.append("` is null limit 1"))) {
+  } else if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_spi_connection_with_external_session(
+                 &session, conn_guard))) {
+  } else if (OB_ISNULL(inner_conn = as_inner_sql_connection(conn_guard.get_ptr()))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObSQLSessionInfo::StmtSavedValue saved_session;
+    ObIInnerSQLConnection::SavedValue saved_conn;
+    // The rewrite runs before the statement itself starts, but PL and PS calls reach it while a
+    // statement is already in progress. A nested session is only possible in the latter case.
+    const bool nested = session.has_start_stmt();
+    const bool was_maintaining = session.in_ai_column_maintenance();
+    // Marks the probe so its own rewrite is skipped instead of checking the same column again.
+    session.set_ai_column_maintenance(true);
+    if (nested && OB_FAIL(inner_conn->begin_nested_session(saved_session, saved_conn,
+                                                           false /* skip_cur_stmt_tables */))) {
+      session.set_ai_column_maintenance(was_maintaining);
+    } else {
+      SMART_VAR(ObISQLClient::ReadResult, result) {
+        if (OB_FAIL(inner_conn->execute_read(sql.string(), result, true /* is_user_sql */))) {
+        } else if (OB_ISNULL(result.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(result.get_result()->next())) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+        } else {
+          has_pending = true;
+        }
+      }
+      if (nested) {
+        int tmp_ret = OB_SUCCESS;
+        if (OB_SUCCESS != (tmp_ret = inner_conn->end_nested_session(saved_session, saved_conn))) {
+          LOG_WARN("failed to restore the session after the ai column strict read", K(tmp_ret));
+          if (OB_SUCCESS == ret) {
+            ret = tmp_ret;
+          }
+        }
+      }
+      session.set_ai_column_maintenance(was_maintaining);
+    }
+  }
+  return ret;
+}
+
+// Strict read: a statement that reads an AI column fails while any row of that column still has
+// no value, no matter which rows the statement selects. Only the AI columns named by the
+// statement are checked, so a ready column stays readable next to an unfinished one.
+int aic_check_strict_read(ObIAllocator &alloc,
+                          ObSQLSessionInfo &session,
+                          const ObString &sql,
+                          const ObIArray<ObString> &identifiers)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator probe_alloc;
+  ObSchemaGetterGuard schema_guard;
+  ObSEArray<ObString, 16> db_names;
+  ObSEArray<ObString, 16> table_names;
+  ObSEArray<AiColumnTableRef, 8> table_refs;
+  const ObString session_db = session.get_database_name();
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(schema_guard))) {
+    LOG_WARN("failed to get the runtime schema guard", K(ret));
+  } else if (OB_FAIL(ObAiColumnUtils::collect_table_refs(probe_alloc, sql, db_names, table_names))) {
+    LOG_WARN("failed to collect the table references", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_names.count(); ++i) {
+    const ObString db_name = db_names.at(i).empty() ? session_db : db_names.at(i);
+    const ObTableSchema *table_schema = NULL;
+    ObSEArray<ObAiColumnUtils::ColumnDesc, 4> columns;
+    int64_t ai_column_count = 0;
+    if (OB_FAIL(aic_find_table(schema_guard, db_name, table_names.at(i), table_schema))) {
+    } else if (NULL == table_schema || aic_has_table_ref(table_refs, table_schema->get_table_id())) {
+      // not a table, or a table whose AI columns are already checked
+    } else if (OB_FAIL(ObAiColumnUtils::collect_ai_columns(probe_alloc, *table_schema, columns,
+                                                           ai_column_count))) {
+      LOG_WARN("failed to collect the ai columns", K(ret), K(table_schema->get_table_id()));
+    } else if (0 == ai_column_count) {
+    } else {
+      AiColumnTableRef ref;
+      ref.table_id_ = table_schema->get_table_id();
+      ref.database_name_ = db_name;
+      ref.table_name_ = table_schema->get_table_name_str();
+      if (OB_FAIL(table_refs.push_back(ref))) {
+      }
+      for (int64_t j = 0; OB_SUCC(ret) && j < columns.count(); ++j) {
+        const ObAiColumnUtils::ColumnDesc &column = columns.at(j);
+        bool has_pending = false;
+        if (!aic_has_identifier(identifiers, column.column_name_)) {
+        } else if (OB_FAIL(aic_has_pending_row(session, db_name, ref.table_name_,
+                                               column.column_name_, has_pending))) {
+          LOG_WARN("failed to check the ai column state", K(ret), K(column.column_name_));
+        } else if (has_pending) {
+          ret = OB_AI_COLUMN_UNFINISHED_TASKS;
+          LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASKS,
+                         static_cast<int64_t>(ref.table_id_),
+                         static_cast<int64_t>(column.column_id_));
+        }
+      }
+    }
+  }
+  UNUSED(alloc);
+  return ret;
+}
+
+// A changed dependency or rowkey invalidates the AI columns computed from it. The statement is
+// extended in place, so the invalidated value is visible to the statement itself and to the rest
+// of the transaction instead of being noticed by a background job later on.
+int aic_rewrite_update(ObIAllocator &alloc,
+                       ObSQLSessionInfo &session,
+                       const ObIArray<ObString> &table_pieces,
+                       const ObIArray<ObString> &set_targets,
+                       const int64_t set_end,
+                       ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator probe_alloc;
+  ObSchemaGetterGuard schema_guard;
+  ObSEArray<ObAiColumnUtils::ColumnDesc, 4> columns;
+  ObSEArray<ObString, 4> invalidated;
+  int64_t ai_column_count = 0;
+  const ObString session_db = session.get_database_name();
+  ObString db_name;
+  ObString table_name;
+  const ObTableSchema *table_schema = NULL;
+  if (table_pieces.empty() || set_targets.empty() || set_end <= 0 || set_end > sql.length()) {
+  } else if (FALSE_IT(table_name = table_pieces.at(table_pieces.count() - 1))) {
+  } else if (FALSE_IT(db_name = table_pieces.count() > 1 ? table_pieces.at(0) : session_db)) {
+  } else if (db_name.empty() || table_name.empty()) {
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(schema_guard))) {
+    LOG_WARN("failed to get the runtime schema guard", K(ret));
+  } else if (OB_FAIL(aic_find_table(schema_guard, db_name, table_name, table_schema))) {
+  } else if (NULL == table_schema) {
+    // the missing table is reported by the resolver
+  } else if (OB_FAIL(ObAiColumnUtils::collect_ai_columns(probe_alloc, *table_schema, columns,
+                                                         ai_column_count))) {
+    LOG_WARN("failed to collect the ai columns", K(ret), K(table_name));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    const ObAiColumnUtils::ColumnDesc &column = columns.at(i);
+    bool invalidated_now = false;
+    if (aic_has_identifier(set_targets, column.column_name_)) {
+      // an AI column assigned by the statement keeps the assigned value
+    } else {
+      for (int64_t j = 0; !invalidated_now && j < set_targets.count(); ++j) {
+        const ObString &target = set_targets.at(j);
+        if (aic_is_rowkey_column(*table_schema, target)) {
+          invalidated_now = true;
+        }
+        for (int64_t k = 0; !invalidated_now && k < column.spec_.dep_columns_.count(); ++k) {
+          invalidated_now = (0 == column.spec_.dep_columns_.at(k).case_compare(target));
+        }
+      }
+      if (invalidated_now && OB_FAIL(invalidated.push_back(column.column_name_))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !invalidated.empty()) {
+    ObSqlString rewritten;
+    if (OB_FAIL(rewritten.append(sql.ptr(), static_cast<int32_t>(set_end)))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < invalidated.count(); ++i) {
+      if (OB_FAIL(rewritten.append(", `"))) {
+      } else if (OB_FAIL(rewritten.append(invalidated.at(i)))) {
+      } else if (OB_FAIL(rewritten.append("` = null"))) {
+      }
+    }
+    if (OB_SUCC(ret) && set_end < sql.length() && OB_FAIL(rewritten.append(" "))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(rewritten.append(sql.ptr() + set_end,
+                                                        sql.length() - static_cast<int32_t>(set_end)))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(ob_write_string(alloc,
+                                                       ObString(static_cast<int32_t>(rewritten.length()),
+                                                                rewritten.ptr()),
+                                                       sql))) {
+    }
+  }
+  return ret;
+}
+
+// Applies the AI column semantics that have to hold for every statement of the session: the
+// strict read check and the invalidation of AI columns whose dependency an UPDATE assigns.
+int rewrite_ai_column_dml(ObIAllocator &alloc, ObSQLSessionInfo &session, ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator probe_alloc;
+  ObSEArray<ObString, 32> identifiers;
+  ObSEArray<ObString, 4> table_pieces;
+  ObSEArray<ObString, 8> set_targets;
+  bool is_update = false;
+  bool strict_read = false;
+  int64_t set_end = 0;
+  if (OB_FAIL(ObAiColumnUtils::collect_identifiers(probe_alloc, sql, identifiers))) {
+    LOG_WARN("failed to collect the identifiers", K(ret));
+  } else if (OB_FAIL(ObAiColumnUtils::parse_update_stmt(probe_alloc, sql, table_pieces,
+                                                        set_targets, set_end, is_update))) {
+    LOG_WARN("failed to parse the update statement", K(ret));
+  } else if (OB_FAIL(session.get_ai_column_strict_read(strict_read))) {
+    LOG_WARN("failed to get the ai column strict read mode", K(ret));
+  } else if (strict_read && OB_FAIL(aic_check_strict_read(alloc, session, sql, identifiers))) {
+  } else if (is_update && OB_FAIL(aic_rewrite_update(alloc, session, table_pieces, set_targets,
+                                                     set_end, sql))) {
+  }
+  return ret;
+}
+
+} // namespace
+
+int rewrite_ai_column_stmt(ObIAllocator &alloc,
+                           ObSQLSessionInfo &session,
+                           const ObString &sql,
+                           ObString &rewritten_sql)
+{
+  int ret = OB_SUCCESS;
+  ObAiColumnUtils::RetryStmt retry;
+  bool is_retry = false;
+  bool rewritten = false;
+  rewritten_sql = sql;
+  if (session.is_inner() || session.in_ai_column_maintenance()) {
+    // statements issued by the AI column maintenance are standard SQL already
+  } else if (OB_FAIL(ObAiColumnUtils::parse_retry_stmt(sql, retry, is_retry))) {
+    LOG_WARN("failed to parse retry ai column statement", K(ret), K(sql));
+  } else if (!is_retry) {
+    if (OB_FAIL(ObAiColumnUtils::rewrite_stmt(alloc, sql, rewritten_sql, rewritten))) {
+      LOG_WARN("failed to rewrite ai column statement", K(ret), K(sql));
+    } else if (OB_FAIL(rewrite_ai_column_dml(alloc, session, rewritten_sql))) {
+      LOG_WARN("failed to apply the ai column semantics", K(ret), K(sql));
+    }
+  } else {
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *table_schema = NULL;
+    const ObColumnSchemaV2 *column = NULL;
+    ObString database_name = retry.db_name_;
+    ObAiColumnSpec spec;
+    bool is_ai_column = false;
+    if (retry.has_extra_action_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+    } else {
+      if (database_name.empty()) {
+        // the current database of the session is used when the statement has no qualifier
+        database_name = session.get_database_name();
+      }
+      if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
+                    .get_runtime_schema_guard(schema_guard))) {
+      } else if (OB_FAIL(schema_guard.get_table_schema(database_name,
+                                                       retry.table_name_,
+                                                       false,
+                                                       table_schema))) {
+        LOG_WARN("failed to get table schema", K(ret), K(database_name), K(retry.table_name_));
+      } else if (OB_ISNULL(table_schema)) {
+        // let the rewritten statement report the missing table
+      } else if (OB_ISNULL(column = table_schema->get_column_schema(retry.column_name_))) {
+        // let the rewritten statement report the missing column
+      } else if (OB_FAIL(ObAiColumnUtils::parse_spec(column->get_comment_str(),
+                                                     alloc,
+                                                     spec,
+                                                     is_ai_column))) {
+        LOG_WARN("failed to parse ai column spec", K(ret), K(column->get_column_name_str()));
+      } else if (!is_ai_column) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(ObAiColumnUtils::build_retry_update(alloc, retry, rewritten_sql))) {
+      LOG_WARN("failed to build the retry statement", K(ret), K(sql));
+    }
+  }
+  return ret;
+}
+
 int ObSql::parser_and_check(const ObString &outlined_stmt,
                             ObExecContext &exec_ctx,
                             ObPlanCacheCtx &pc_ctx,
@@ -3185,7 +3542,12 @@ int ObSql::parser_and_check(const ObString &outlined_stmt,
     pctx->reset_datum_param_store();
     pctx->get_param_store_for_update().reuse();
     ObParser parser(allocator, session->get_sql_mode(), session->get_charsets4parser());
-    if (OB_FAIL(parser.parse(outlined_stmt, parse_result,
+    ObString stmt_to_parse;
+    if (OB_FAIL(rewrite_ai_column_stmt(allocator, *session, outlined_stmt, stmt_to_parse))) {
+      // The statement is rejected before it is parsed, so there is no parser state to recover
+      // from and the session keeps the connection for the next statement.
+      exec_ctx.set_need_disconnect(false);
+    } else if (OB_FAIL(parser.parse(stmt_to_parse, parse_result,
                              STD_MODE,
                              pc_ctx.sql_ctx_.handle_batched_multi_stmt(),
                              false, NULL != session->get_pl_context()))) {

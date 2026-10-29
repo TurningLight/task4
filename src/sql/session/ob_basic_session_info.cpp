@@ -111,6 +111,7 @@ ObBasicSessionInfo::ObBasicSessionInfo()
       next_tx_isolation_(transaction::ObTxIsolationLevel::INVALID),
       is_diagnosis_enabled_(false),
       diagnosis_limit_num_(0),
+      ai_column_maintenance_(false),
       log_id_level_map_valid_(false),
       cur_phy_plan_(NULL),
       plan_id_(0),
@@ -3032,6 +3033,16 @@ int ObBasicSessionInfo::is_push_join_predicate_enabled(bool &push_join_predicate
 int ObBasicSessionInfo::get_ob_sparse_drop_ratio_search(uint64_t &ob_sparse_drop_ratio_search) const
 {
   return get_uint64_sys_var(SYS_VAR_OB_SPARSE_DROP_RATIO_SEARCH, ob_sparse_drop_ratio_search);
+}
+
+int ObBasicSessionInfo::get_enable_file_sql(bool &enable_file_sql) const
+{
+  return get_bool_sys_var(SYS_VAR_ENABLE_FILE_SQL, enable_file_sql);
+}
+
+int ObBasicSessionInfo::get_ai_column_strict_read(bool &strict_read) const
+{
+  return get_bool_sys_var(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read);
 }
 ////////////////////////////////////////////////////////////////
 int ObBasicSessionInfo::replace_user_variables(const ObSessionValMap &user_var_map)

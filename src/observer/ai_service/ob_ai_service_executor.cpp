@@ -128,7 +128,6 @@ int ObAiServiceExecutor::alter_ai_model_endpoint(ObArenaAllocator &allocator, co
   ObAiModelEndpointInfo old_endpoint;
   ObAiModelEndpointInfo new_endpoint;
   ObMySQLTransaction trans;
-  ObAiModelEndpointInfo tmp_endpoint;
   ObNameCaseMode name_case_mode;
   
    // AI model names may be case-sensitive, so use the runtime name-case mode.
@@ -140,22 +139,12 @@ int ObAiServiceExecutor::alter_ai_model_endpoint(ObArenaAllocator &allocator, co
   } else if (OB_FAIL(construct_new_endpoint(allocator, old_endpoint, alter_jbase, new_endpoint))) {
   } else if (OB_FAIL(new_endpoint.check_valid())) {
   } else if (OB_FAIL(local_get_runtime_name_case_mode(name_case_mode))) {
-  } else if (ObCharset::case_mode_equal(name_case_mode, new_endpoint.get_ai_model_name(), old_endpoint.get_ai_model_name())) {
-    // need check name case mode equal, if not change ai model name, just update the endpoint 
-    LOG_INFO("ai model name is the same, just update the endpoint", KR(ret), K(name), K(name_case_mode), K(new_endpoint), K(old_endpoint));
-  } else if (OB_FAIL(local_check_ai_model_exists(new_endpoint.get_ai_model_name()))) {
+  } else if (!ObCharset::case_mode_equal(name_case_mode, new_endpoint.get_ai_model_name(), old_endpoint.get_ai_model_name())) {
+    // ai_model_name identifies the endpoint's model and is immutable after creation
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("ai_model_name"), "ai_model_name");
   } else {
-    // if change ai model name, check if the ai model endpoint has the same ai model name is already exists
-    // if not exists, continue
-    if (OB_FAIL(read_ai_endpoint_by_ai_model_name(allocator, new_endpoint.get_ai_model_name(), tmp_endpoint))) {
-      if (ret == OB_AI_FUNC_ENDPOINT_NOT_FOUND) {
-        ret = OB_SUCCESS;
-      } else {
-      }
-    } else {
-      ret = OB_AI_FUNC_ENDPOINT_EXISTS;
-      FORWARD_USER_ERROR_MSG(OB_AI_FUNC_ENDPOINT_EXISTS, "The ai model endpoint '%.*s' has the same ai model name '%.*s'", tmp_endpoint.get_name().length(), tmp_endpoint.get_name().ptr(), tmp_endpoint.get_ai_model_name().length(), tmp_endpoint.get_ai_model_name().ptr());
-    }
+    LOG_INFO("ai model name is the same, just update the endpoint", KR(ret), K(name), K(name_case_mode), K(new_endpoint), K(old_endpoint));
   }
   
   if (OB_FAIL(ret)) {

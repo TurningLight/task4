@@ -22,6 +22,7 @@
 #include "sql/resolver/expr/ob_raw_expr_resolver_impl.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/resolver/dml/ob_file_sql.h"
 #include "sql/resolver/expr/ob_shared_expr_resolver.h"
 namespace oceanbase
 {
@@ -208,6 +209,10 @@ public:
   int resolve_json_table_item(const ParseNode &table_node,
                               TableItem *&table_item);
   int resolve_unnest_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_table_args(const ParseNode *args_node,
+                              common::ObString &path,
+                              ObFileSqlOptions &options);
   int create_unnest_table_item(TableItem *&table_item, ObString table_name);
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);

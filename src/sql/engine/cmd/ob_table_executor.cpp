@@ -42,6 +42,7 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "share/ai_column/ob_ai_column_meta.h"
 namespace oceanbase
 {
 using namespace common;
@@ -486,6 +487,14 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
         if (OB_FAIL(ObDDLExecutorUtil::execute_pcreate_table(
             my_session, ctx.root_command_service(), "[parallel create table]",
                                                           create_table_arg, res))) {
+        } else {
+          int64_t ai_column_count = 0;
+          if (OB_ISNULL(GCTX.sql_proxy_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(share::ObAiColumnMetaHelper::sync_table_ai_columns(
+                       *GCTX.sql_proxy_, res.table_id_, ai_column_count))) {
+            LOG_WARN("failed to write ai column metadata", K(ret), K(res.table_id_));
+          }
         }
       }
     } else {
@@ -827,6 +836,18 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
                                                 ctx.root_command_service(),
                                                 *ctx.get_query_runtime_environment(),
                                                 ctx.local_command_service()))) {
+          }
+          if (OB_SUCC(ret)) {
+            int64_t ai_column_count = 0;
+            // The root service fills table_id_ while executing the rpc, the copy held by the
+            // sql node keeps the id that the resolver stored in the alter schema.
+            const uint64_t ai_table_id = alter_table_arg.alter_table_schema_.get_table_id();
+            if (OB_ISNULL(GCTX.sql_proxy_)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_FAIL(share::ObAiColumnMetaHelper::sync_table_ai_columns(
+                         *GCTX.sql_proxy_, ai_table_id, ai_column_count))) {
+              LOG_WARN("failed to write ai column metadata", K(ret), K(ai_table_id));
+            }
           }
         }
       }

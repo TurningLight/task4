@@ -1349,6 +1349,11 @@ int ObServer::start()
   } else if (!stop_) {
     GCTX.status_ = SS_SERVING;
     GCTX.start_service_time_ = start_service_time;
+    if (OB_FAIL(ai_column_worker_.start())) {
+      // AI columns are recomputed asynchronously; the rest of the server still works.
+      LOG_WARN("fail to start ai column worker, ai columns will stay null", KR(ret));
+      ret = OB_SUCCESS;
+    }
     FLOG_INFO("[OBSERVER_NOTICE] observer start service", "start_service_time", GCTX.start_service_time_);
     LOG_DBA_INFO_V2(OB_SERVER_START_SUCCESS,
                     DBA_STEP_INC_INFO(server_start),
@@ -1553,6 +1558,13 @@ int ObServer::stop()
   int fail_ret = OB_SUCCESS;
   FLOG_INFO("[OBSERVER_NOTICE] stop observer begin");
   LOG_DBA_INFO_V2(OB_SERVER_STOP_BEGIN, "observer stop begin.");
+
+  // Stop the AI column worker first: it issues SQL through sql_proxy_ and needs the schema and
+  // SQL engine that the steps below tear down.
+  FLOG_INFO("begin to stop ai column worker");
+  ai_column_worker_.stop();
+  ai_column_worker_.wait();
+  FLOG_INFO("stop ai column worker success");
 
   if (in_process_) {
     // DDL retries must observe cancellation while schema and SQL services are still available.
@@ -2036,6 +2048,7 @@ int ObServer::init_sql_proxy()
   int ret = OB_SUCCESS;
   if (OB_FAIL(sql_proxy_.init(false /* is_ddl */))) {
   } else if (OB_FAIL(ddl_sql_proxy_.init(true /* is_ddl */))) {
+  } else if (OB_FAIL(ai_column_worker_.init(sql_proxy_))) {
   }
   return ret;
 }

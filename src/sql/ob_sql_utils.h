@@ -1120,6 +1120,7 @@ public:
     : session_(session),
       exec_ctx_(exec_ctx),
       is_linked_(false),
+      is_nested_(false),
       is_autocommit_(false)
   {
     link_current_context();
@@ -1140,6 +1141,7 @@ private:
   ObSQLSessionInfo &session_;
   ObExecContext &exec_ctx_;
   bool is_linked_;
+  bool is_nested_;
   bool is_autocommit_;
 };
 

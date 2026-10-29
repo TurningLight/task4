@@ -1206,6 +1206,7 @@ int ObSelectIntoOp::check_secure_file_path(ObString file_name)
   char *actual_path = nullptr;
   ObSqlString sql_str;
   ObString secure_file_priv;
+  bool enable_file_sql = false;
   
   if (OB_FAIL(sql_str.append(file_path.empty() ? "." : file_path))) {
 #ifdef _WIN32
@@ -1214,6 +1215,13 @@ int ObSelectIntoOp::check_secure_file_path(ObString file_name)
   } else if (OB_ISNULL(actual_path = realpath(sql_str.ptr(), full_path_buf))) {
 #endif
     ret = OB_FILE_NOT_EXIST;
+  } else if (OB_ISNULL(ctx_.get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ctx_.get_my_session()->get_enable_file_sql(enable_file_sql))) {
+  } else if (enable_file_sql) {
+    // The file access itself is already gated by enable_file_sql, which is off
+    // by default, so COPY of a query does not additionally require
+    // secure_file_priv to be configured.
   } else if (OB_FAIL(ObSchemaUtils::get_runtime_varchar_variable(*GCTX.schema_service_,
                                                                 SYS_VAR_SECURE_FILE_PRIV,
                                                                 ctx_.get_allocator(),

@@ -18,6 +18,12 @@
 
 #include "ob_table_modify_op.h"
 #include "share/ob_autoincrement_service.h"
+#include "share/ai_column/ob_ai_column_utils.h"
+#include "share/ai_column/ob_ai_column_task.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/string/ob_sql_string.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
@@ -1065,6 +1071,112 @@ int ObTableModifyOp::submit_all_dml_task()
   return ret;
 }
 
+// Runs one maintenance statement on the transaction of the statement that triggered it, so the
+// task rows appear and disappear together with the rows they describe.
+int ObTableModifyOp::execute_ai_column_maintenance(const ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(open_inner_conn())) {
+    LOG_WARN("failed to open the inner connection", K(ret));
+  } else if (OB_FAIL(begin_nested_session(false /* skip_cur_stmt_tables */))) {
+    LOG_WARN("failed to begin the nested session", K(ret));
+  } else {
+    // the nested statements must not maintain AI columns again
+    session->set_ai_column_maintenance(true);
+    if (OB_FAIL(inner_conn_->execute_write(sql, affected_rows))) {
+      LOG_WARN("failed to execute the ai column maintenance", K(ret), K(sql));
+    }
+    session->set_ai_column_maintenance(false);
+    int tmp_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (tmp_ret = end_nested_session())) {
+      LOG_WARN("failed to end the nested session", K(tmp_ret));
+      if (OB_SUCCESS == ret) {
+        ret = tmp_ret;
+      }
+    }
+  }
+  (void)close_inner_conn();
+  return ret;
+}
+
+int ObTableModifyOp::maintain_ai_columns()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  ObArenaAllocator allocator(ObModIds::OB_SQL_EXECUTOR);
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  ObSEArray<ObAiColumnUtils::ColumnDesc, 4> columns;
+  ObTableID table_loc_id = OB_INVALID_ID;
+  ObTableID ref_table_id = OB_INVALID_ID;
+  int64_t ai_column_count = 0;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null", K(ret));
+  } else if (session->is_inner() || session->in_ai_column_maintenance()) {
+    // the AI worker and the maintenance statements themselves never maintain again
+  } else if (OB_SUCCESS != get_spec().get_single_table_loc_id(table_loc_id, ref_table_id)) {
+    // only a single table DML can create tasks
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
+                       .get_runtime_schema_guard(schema_guard))) {
+    LOG_WARN("failed to get the runtime schema guard", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(ref_table_id, table_schema))) {
+    LOG_WARN("failed to get the table schema", K(ret), K(ref_table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    // an index table or a dropped table: nothing to maintain
+  } else if (OB_FAIL(ObAiColumnUtils::collect_ai_columns(allocator, *table_schema, columns,
+                                                         ai_column_count))) {
+    LOG_WARN("failed to collect the ai columns", K(ret), K(ref_table_id));
+  } else if (0 == ai_column_count) {
+    // nothing to maintain
+  } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                      db_schema))) {
+    LOG_WARN("failed to get the database schema", K(ret), K(table_schema->get_database_id()));
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("database schema is null", K(ret), K(table_schema->get_database_id()));
+  } else {
+    const ObString database_name = db_schema->get_database_name_str();
+    const ObString table_name = table_schema->get_table_name_str();
+    const uint64_t table_id = table_schema->get_table_id();
+    ObString predicate_expr;
+    ObString request_id;
+    if (OB_FAIL(ObAiColumnTaskHelper::build_rowkey_predicate_expr(allocator, *table_schema,
+                                                                  predicate_expr))) {
+      LOG_WARN("failed to build the rowkey predicate", K(ret), K(table_id));
+    } else if (OB_FAIL(ObAiColumnTaskHelper::generate_request_id(allocator, request_id))) {
+      LOG_WARN("failed to generate the request id", K(ret));
+    }
+    // Every AI column of the statement shares one request id, which is what makes the columns of
+    // one row become visible together in the worker.
+    for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+      const ObAiColumnUtils::ColumnDesc &column = columns.at(i);
+      ObString enqueue_sql;
+      ObString cleanup_sql;
+      if (OB_FAIL(ObAiColumnTaskHelper::build_enqueue_sql(allocator, table_id, column.column_id_,
+                                                          database_name, table_name,
+                                                          column.column_name_, predicate_expr,
+                                                          request_id, enqueue_sql))) {
+        LOG_WARN("failed to build the enqueue statement", K(ret), K(column.column_name_));
+      } else if (OB_FAIL(ObAiColumnTaskHelper::build_cleanup_sql(allocator, table_id,
+                                                                 column.column_id_,
+                                                                 database_name, table_name,
+                                                                 column.column_name_,
+                                                                 predicate_expr, cleanup_sql))) {
+        LOG_WARN("failed to build the cleanup statement", K(ret), K(column.column_name_));
+      } else if (OB_FAIL(execute_ai_column_maintenance(enqueue_sql))) {
+      } else if (OB_FAIL(execute_ai_column_maintenance(cleanup_sql))) {
+      }
+    }
+  }
+  return ret;
+}
+
 //The data to be written by DML will be buffered in the DAS Write Buffer
 //When the buffer data exceeds 6M,
 //needs to be written to the storage to release the memory.
@@ -1129,6 +1241,11 @@ int ObTableModifyOp::inner_get_next_row()
       //DML operator reach iter end,
       //now submit the remaining rows in the DAS Write Buffer to the storage
       if (OB_FAIL(submit_all_dml_task())) {
+      }
+    }
+    if (OB_SUCC(ret) && iter_end_) {
+      if (OB_FAIL(maintain_ai_columns())) {
+        LOG_WARN("failed to maintain the ai columns", K(ret));
       }
     }
     //to post process the DML info after writing all data to the storage or returning one row

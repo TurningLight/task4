@@ -25,6 +25,7 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_column/ob_ai_column_utils.h"
 
 namespace oceanbase
 {
@@ -598,6 +599,7 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       }
     }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(resolve_ai_columns())) {
     } else if (OB_FAIL(check_skip_index(alter_table_stmt->get_alter_table_arg().alter_table_schema_))) {
     }
     //deal with drop column affer drop constraint (mysql mode)
@@ -3462,6 +3464,130 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_ai_columns()
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    AlterTableSchema &alter_table_schema =
+        alter_table_stmt->get_alter_table_arg().alter_table_schema_;
+    ObSEArray<ObString, 4> ai_column_names;
+    // AI columns that already exist on the table, their values are not available as inputs either.
+    for (ObTableSchema::const_column_iterator it = table_schema_->column_begin();
+         OB_SUCC(ret) && it != table_schema_->column_end(); ++it) {
+      const ObColumnSchemaV2 *column = *it;
+      share::ObAiColumnSpec spec;
+      bool is_ai_column = false;
+      ObString column_name;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(share::ObAiColumnUtils::parse_spec(column->get_comment_str(),
+                                                     *allocator_,
+                                                     spec,
+                                                     is_ai_column))) {
+        SQL_RESV_LOG(WARN, "failed to parse ai column spec", K(ret), KPC(column));
+      } else if (!is_ai_column) {
+      } else if (OB_FAIL(ob_write_string(*allocator_, column->get_column_name_str(), column_name))) {
+      } else if (OB_FAIL(ai_column_names.push_back(column_name))) {
+      }
+    }
+    // The maintenance columns are appended after this scan, appending during the scan would
+    // invalidate the column iterator.
+    const int64_t existing_ai_count = ai_column_names.count();
+    for (ObTableSchema::const_column_iterator it = alter_table_schema.column_begin();
+         OB_SUCC(ret) && it != alter_table_schema.column_end(); ++it) {
+      const AlterColumnSchema *column = static_cast<const AlterColumnSchema *>(*it);
+      share::ObAiColumnSpec spec;
+      bool is_ai_column = false;
+      ObString column_name;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_DDL_ADD_COLUMN != column->alter_type_) {
+      } else if (OB_FAIL(share::ObAiColumnUtils::parse_spec(column->get_comment_str(),
+                                                     *allocator_,
+                                                     spec,
+                                                     is_ai_column))) {
+        SQL_RESV_LOG(WARN, "failed to parse ai column spec", K(ret), KPC(column));
+      } else if (!is_ai_column) {
+      } else if (OB_FAIL(ob_write_string(*allocator_, column->get_column_name_str(), column_name))) {
+      } else if (OB_FAIL(ai_column_names.push_back(column_name))) {
+      } else if (share::OB_AI_COLUMN_TYPE_EMBED == spec.ai_type_) {
+        int64_t dim = 0;
+        if (!ob_is_collection_sql_type(column->get_data_type())) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "declaring an AI EMBED column as a non-vector column is");
+          SQL_RESV_LOG(WARN, "ai embed column must be a vector column", K(ret), KPC(column));
+        } else if (OB_FAIL(share::ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+                       column->get_extended_type_info(), dim))) {
+          SQL_RESV_LOG(WARN, "failed to get vector dimension of the ai column", K(ret), KPC(column));
+        } else if (spec.dimension_ > 0 && dim != spec.dimension_) {
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                         static_cast<uint32_t>(dim), static_cast<uint32_t>(spec.dimension_));
+          SQL_RESV_LOG(WARN, "ai embed dimension mismatches the vector column", K(ret),
+                       KPC(column), K(dim), K(spec.dimension_));
+        }
+      }
+    }
+    // The value of an AI column is produced asynchronously, so it cannot be an input of another
+    // AI column of the same table.
+    for (ObTableSchema::const_column_iterator it = alter_table_schema.column_begin();
+         OB_SUCC(ret) && it != alter_table_schema.column_end(); ++it) {
+      const AlterColumnSchema *column = static_cast<const AlterColumnSchema *>(*it);
+      share::ObAiColumnSpec spec;
+      bool is_ai_column = false;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_DDL_ADD_COLUMN != column->alter_type_) {
+      } else if (OB_FAIL(share::ObAiColumnUtils::parse_spec(column->get_comment_str(),
+                                                     *allocator_,
+                                                     spec,
+                                                     is_ai_column))) {
+        SQL_RESV_LOG(WARN, "failed to parse ai column spec", K(ret), KPC(column));
+      } else if (!is_ai_column) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < spec.dep_columns_.count(); ++i) {
+          for (int64_t j = 0; OB_SUCC(ret) && j < ai_column_names.count(); ++j) {
+            if (ObCharset::case_insensitive_equal(spec.dep_columns_.at(i), ai_column_names.at(j))) {
+              ret = OB_NOT_SUPPORTED;
+              SQL_RESV_LOG(WARN, "an ai column cannot depend on another ai column", K(ret),
+                           K(ai_column_names.at(j)), K(spec.dep_columns_.at(i)));
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && existing_ai_count < ai_column_names.count()) {
+      // The maintenance columns are plain hidden columns, they cannot be added by instant DDL.
+      alter_table_stmt->get_alter_table_arg().alter_algorithm_ =
+          obcall::ObAlterTableArg::AlterAlgorithm::INPLACE;
+    }
+    for (int64_t i = existing_ai_count; OB_SUCC(ret) && i < ai_column_names.count(); ++i) {
+      for (int64_t kind = share::OB_AI_COLUMN_HIDDEN_STATE;
+           OB_SUCC(ret) && kind < share::OB_AI_COLUMN_HIDDEN_MAX; ++kind) {
+        ObColumnSchemaV2 maintenance_column;
+        AlterColumnSchema hidden_column;
+        if (OB_FAIL(share::ObAiColumnUtils::build_hidden_column(*allocator_,
+                                                         ai_column_names.at(i),
+                                                         kind,
+                                                         0,
+                                                         maintenance_column))) {
+          SQL_RESV_LOG(WARN, "failed to build ai column maintenance column", K(ret),
+                       K(ai_column_names.at(i)), K(kind));
+        } else if (OB_FAIL(hidden_column.assign(maintenance_column))) {
+        } else {
+          hidden_column.alter_type_ = OB_DDL_ADD_COLUMN;
+          if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
+          }
+        }
+      }
+    }
   }
   return ret;
 }

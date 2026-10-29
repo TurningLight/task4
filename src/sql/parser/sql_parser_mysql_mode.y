@@ -408,6 +408,8 @@ END_P SET_VAR DELIMITER
 %type <node> from_list table_references table_reference table_factor normal_relation_factor dot_relation_factor relation_factor
 %type <node> relation_factor_in_hint relation_factor_in_hint_list relation_factor_in_pq_hint opt_relation_factor_in_hint_list relation_factor_in_use_join_hint_list
 %type <node> relation_factor_in_leading_hint_list joined_table tbl_name table_subquery table_subquery_alias
+%type <node> file_table_expr file_table_expr_arg_list
+%type <node> copy_query_stmt copy_query_option_list copy_query_option copy_query_option_value
 %type <node> relation_factor_with_star relation_with_star_list opt_with_star
 %type <node> index_hint_type key_or_index index_hint_scope index_element index_list opt_index_list opt_index_prefix union_merge_list
 %type <node> add_key_or_index_opt add_key_or_index add_unique_key_opt add_unique_key add_constraint_uniq_key_opt add_constraint_uniq_key add_constraint_pri_key_opt add_constraint_pri_key add_primary_key_opt add_primary_key add_spatial_index_opt add_spatial_index
@@ -582,6 +584,7 @@ stmt:
   | drop_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | drop_view_stmt          { $$ = $1; check_question_mark($$, result); }
   | explain_stmt            { $$ = $1; question_mark_issue($$, result); }
+  | copy_query_stmt         { $$ = $1; check_question_mark($$, result); }
   | create_outline_stmt     { $$ = $1; question_mark_issue($$, result); }
   | alter_outline_stmt      { $$ = $1; question_mark_issue($$, result); }
   | drop_outline_stmt       { $$ = $1; check_question_mark($$, result); }
@@ -10844,9 +10847,39 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | hybrid_search_expr
 {
   $$ = $1;
+}
+;
+
+file_table_expr:
+NAME_OB '(' file_table_expr_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 3, $1, $3, NULL);
+}
+| NAME_OB '(' file_table_expr_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 3, $1, $3, $5);
+}
+| NAME_OB '(' file_table_expr_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 3, $1, $3, $6);
+}
+;
+
+file_table_expr_arg_list:
+expr
+{
+  $$ = $1;
+}
+| file_table_expr_arg_list ',' expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
 ;
 
@@ -12322,6 +12355,57 @@ TRADITIONAL
 { malloc_terminal_node($$, result->malloc_pool_, T_TRADITIONAL); }
 | JSON
 { malloc_terminal_node($$, result->malloc_pool_, T_FORMAT_JSON); }
+;
+
+/*****************************************************************************
+ *
+ *	copy query grammar
+ *
+ *****************************************************************************/
+copy_query_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_QUERY, 3, $3, $6, NULL);
+  dup_string($$, result, @3.first_column, @3.last_column);
+}
+| COPY '(' select_stmt ')' TO STRING_VALUE '(' copy_query_option_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_QUERY, 3, $3, $6, $8);
+  dup_string($$, result, @3.first_column, @3.last_column);
+}
+;
+
+copy_query_option_list:
+copy_query_option
+{
+  $$ = $1;
+}
+| copy_query_option_list ',' copy_query_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_query_option:
+relation_name
+{
+  $$ = $1;
+}
+| relation_name copy_query_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $2);
+}
+;
+
+copy_query_option_value:
+literal
+{
+  $$ = $1;
+}
+| relation_name
+{
+  $$ = $1;
+}
 ;
 
 /*****************************************************************************

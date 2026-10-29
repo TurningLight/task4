@@ -2441,10 +2441,12 @@ all_ai_model_endpoint_def = dict(
         ('request_model_name', 'varchar:128', 'true'),
         ('parameters', 'varchar:2048', 'true'),
         ('request_transform_fn', 'varchar:64', 'true'),
-        ('response_transform_fn', 'varchar:64', 'true')
+        ('response_transform_fn', 'varchar:64', 'true'),
+        ('max_concurrency', 'int', 'false', 8)
     ]
 )
 def_table_schema(**all_ai_model_endpoint_def)
+
 
 
 all_objauth_mysql_def = dict(
@@ -2466,6 +2468,59 @@ all_objauth_mysql_def = dict(
   )
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
+
+all_ai_column_def = dict(
+    owner = 'seekdb',
+    table_name = '__all_ai_column',
+    table_id = '1135',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int')
+    ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('database_name', 'varchar:128', 'true'),
+        ('table_name', 'varchar:128', 'true'),
+        ('column_name', 'varchar:128', 'true'),
+        ('ai_type', 'int', 'false', 1),
+        ('model_name', 'varchar:128', 'true'),
+        ('sync_mode', 'int', 'false', 1),
+        ('max_retries', 'int', 'false', 0),
+        ('state_column_id', 'int', 'false', 0),
+        ('request_column_id', 'int', 'false', 0),
+        ('result_spec_column_id', 'int', 'false', 0),
+        ('dimension', 'int', 'false', 0),
+        ('normalized_expr', 'longtext', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_def)
+
+all_ai_column_task_def = dict(
+    owner = 'seekdb',
+    table_name = '__all_ai_column_task',
+    table_id = '1136',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int'),
+      ('rowkey_predicate', 'varchar:512')
+    ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('request_id', 'varchar:128', 'true'),
+        ('state', 'int', 'false', 0),
+        ('retry_count', 'int', 'false', 0),
+        ('eligible_ts', 'timestamp:6', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
 
 
 # Reserved position (placeholder before this line)
@@ -13819,7 +13874,8 @@ def_table_schema(
       REQUEST_MODEL_NAME,
       PARAMETERS,
       REQUEST_TRANSFORM_FN,
-      RESPONSE_TRANSFORM_FN
+      RESPONSE_TRANSFORM_FN,
+      MAX_CONCURRENCY
     FROM oceanbase.__all_ai_model_endpoint WHERE ENDPOINT_ID != -1;
   """.replace("\n", " ")
 )

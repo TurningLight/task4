@@ -25,6 +25,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
+#include "share/ai_column/ob_ai_column_utils.h"
 
 namespace oceanbase
 {
@@ -884,6 +885,11 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    if (OB_SUCC(ret) && RESOLVE_NON_COL != resolve_rule) {
+      if (OB_FAIL(resolve_ai_columns(resolved_cols, resolved_cols_count))) {
+      }
+    }
+
     if (OB_SUCC(ret)) {
       for (int32_t i = resolved_cols_count; i < resolved_cols.count() && OB_SUCC(ret); i++) {
         ObColumnSchemaV2 &hidden_col = resolved_cols.at(i);
@@ -948,6 +954,91 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // do nothing
       // todo@lanyi This function should be placed in a separate document
       } else if (OB_FAIL(resolve_primary_key_node_in_heap_table(primary_node_in_heap_table, stats, resolved_cols))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableResolver::resolve_ai_columns(
+    ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> &resolved_cols,
+    const int64_t user_column_count)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObString, 4> ai_column_names;
+  for (int64_t i = 0; OB_SUCC(ret) && i < user_column_count; ++i) {
+    const ObColumnSchemaV2 &column = resolved_cols.at(i);
+    ObAiColumnSpec spec;
+    bool is_ai_column = false;
+    ObString column_name;
+    if (OB_FAIL(ObAiColumnUtils::parse_spec(column.get_comment_str(),
+                                            *allocator_,
+                                            spec,
+                                            is_ai_column))) {
+      SQL_RESV_LOG(WARN, "failed to parse ai column spec", K(ret), K(column.get_column_name_str()));
+    } else if (!is_ai_column) {
+      // ordinary column
+    } else if (OB_FAIL(ob_write_string(*allocator_, column.get_column_name_str(), column_name))) {
+    } else if (OB_FAIL(ai_column_names.push_back(column_name))) {
+    } else if (OB_AI_COLUMN_TYPE_EMBED == spec.ai_type_) {
+      int64_t dim = 0;
+      if (!ob_is_collection_sql_type(column.get_data_type())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "declaring an AI EMBED column as a non-vector column is");
+        SQL_RESV_LOG(WARN, "ai embed column must be a vector column", K(ret),
+                     K(column.get_column_name_str()), K(column.get_data_type()));
+      } else if (OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+                     column.get_extended_type_info(), dim))) {
+        SQL_RESV_LOG(WARN, "failed to get vector dimension of the ai column", K(ret), K(column));
+      } else if (spec.dimension_ > 0 && dim != spec.dimension_) {
+        ret = OB_ERR_INVALID_VECTOR_DIM;
+        LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                       static_cast<uint32_t>(dim), static_cast<uint32_t>(spec.dimension_));
+        SQL_RESV_LOG(WARN, "ai embed dimension mismatches the vector column", K(ret),
+                     K(column.get_column_name_str()), K(dim), K(spec.dimension_));
+      }
+    }
+  }
+
+  // The value of an AI column is produced asynchronously, so it cannot be an input of another
+  // AI column of the same table.
+  for (int64_t i = 0; OB_SUCC(ret) && i < user_column_count; ++i) {
+    const ObColumnSchemaV2 &column = resolved_cols.at(i);
+    ObAiColumnSpec spec;
+    bool is_ai_column = false;
+    if (OB_FAIL(ObAiColumnUtils::parse_spec(column.get_comment_str(),
+                                            *allocator_,
+                                            spec,
+                                            is_ai_column))) {
+      SQL_RESV_LOG(WARN, "failed to parse ai column spec", K(ret), K(column.get_column_name_str()));
+    } else if (!is_ai_column) {
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < spec.dep_columns_.count(); ++j) {
+        for (int64_t k = 0; OB_SUCC(ret) && k < ai_column_names.count(); ++k) {
+          if (ObCharset::case_insensitive_equal(spec.dep_columns_.at(j), ai_column_names.at(k))) {
+            ret = OB_NOT_SUPPORTED;
+            SQL_RESV_LOG(WARN, "an ai column cannot depend on another ai column", K(ret),
+                         K(ai_column_names.at(k)), K(spec.dep_columns_.at(j)));
+          }
+        }
+      }
+    }
+  }
+
+  // Each AI column owns three maintenance columns. They are appended after the user columns and
+  // picked up by the hidden column loop of the caller.
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_names.count(); ++i) {
+    for (int64_t kind = OB_AI_COLUMN_HIDDEN_STATE;
+         OB_SUCC(ret) && kind < OB_AI_COLUMN_HIDDEN_MAX; ++kind) {
+      ObColumnSchemaV2 hidden_column;
+      if (OB_FAIL(ObAiColumnUtils::build_hidden_column(*allocator_,
+                                                       ai_column_names.at(i),
+                                                       kind,
+                                                       gen_column_id(),
+                                                       hidden_column))) {
+        SQL_RESV_LOG(WARN, "failed to build ai column maintenance column", K(ret),
+                     K(ai_column_names.at(i)), K(kind));
+      } else if (OB_FAIL(resolved_cols.push_back(hidden_column))) {
       }
     }
   }

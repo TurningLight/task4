@@ -378,19 +378,31 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+namespace
+{
+// Same result as ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, ...), which resolves the
+// collation and validates the arguments on every call. This runs for every
+// character of every token against every range boundary, so the lookup is skipped.
+inline int ft_utf8mb4_bin_cmp(const ObString &l, const ObString &r)
+{
+  const int64_t l_len = l.length();
+  const int64_t r_len = r.length();
+  const int64_t min_len = l_len < r_len ? l_len : r_len;
+  int cmp = 0;
+  if (min_len > 0) {
+    cmp = MEMCMP(l.ptr(), r.ptr(), min_len);
+  }
+  return 0 != cmp ? cmp : static_cast<int>(l_len - r_len);
+}
+} // namespace
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
   for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+    if (ft_utf8mb4_bin_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
+        && ft_utf8mb4_bin_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
       dict = range_dicts_[i].dict_;
       found = true;
     }

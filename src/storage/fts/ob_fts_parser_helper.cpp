@@ -21,6 +21,7 @@
 #include "storage/fts/ob_fts_parser_helper.h"
 
 #include "common/json_type/ob_json_tree.h"
+#include "lib/utility/ob_fast_convert.h"
 #include "share/ob_force_print_log.h"
 #include "storage/fts/dict/ob_ft_dict_hub.h"
 #include "storage/fts/ob_beng_ft_parser.h"
@@ -101,13 +102,23 @@ int ObFTParser::parse_from_str(const char *parser_name, const int64_t buf_len)
 int ObFTParser::serialize_to_str(char *buf, const int64_t buf_len)
 {
   int ret = OB_SUCCESS;
-  int64_t pos = 0;
   if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len < OB_FT_PARSER_NAME_LENGTH)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_UNLIKELY(!is_valid())) {
     ret = OB_NOT_SUPPORTED;
-  } else if (OB_FAIL(common::databuff_printf(buf, buf_len, pos, "%.*s.%ld", parser_name_.len(), parser_name_.str(),
-          parser_version_))) {
+  } else {
+    // Called once per evaluation of TOKENIZE(), so avoid printf formatting here.
+    const common::ObFastFormatInt version_str(parser_version_);
+    const int64_t name_len = parser_name_.len();
+    const int64_t total_len = name_len + 1 + version_str.length();
+    if (OB_UNLIKELY(total_len >= buf_len)) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      MEMCPY(buf, parser_name_.str(), name_len);
+      buf[name_len] = '.';
+      MEMCPY(buf + name_len + 1, version_str.ptr(), version_str.length());
+      buf[total_len] = '\0';
+    }
   }
   return ret;
 }

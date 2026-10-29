@@ -67,6 +67,7 @@
 #include "observer/ob_srv_network_frame.h"
 #include "observer/ob_service.h"
 #include "observer/ob_server_reload_config.h"
+#include "observer/ai_column/ob_ai_column_worker.h"
 #include "storage/slog_ckpt/ob_startup_accel_task_handler.h"
 #include "storage/ddl/ob_ddl_heart_beat_task.h"
 
@@ -460,6 +461,9 @@ private:
 
   // sql session_mgr
   sql::ObSQLSessionMgr session_mgr_;
+
+  // Recomputes the AI columns that DML queued in __all_ai_column_task.
+  ObAiColumnWorker ai_column_worker_;
 
   // Process-local schema, DDL, job, freeze and recycle-bin management.
   rootserver::ObLocalManagementService local_management_service_;

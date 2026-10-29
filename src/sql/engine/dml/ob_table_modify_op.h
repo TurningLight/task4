@@ -251,6 +251,10 @@ public:
 
   ObDMLModifyRowsList& get_dml_modify_row_list() { return dml_modify_rows_;}
   int submit_all_dml_task();
+  // Brings the AI column task table in line with the rows this statement touched: a row whose AI
+  // column has no value gets a task, a task whose row was deleted or already computed is dropped.
+  int maintain_ai_columns();
+  int execute_ai_column_maintenance(const common::ObString &sql);
 
   int perform_batch_fk_check();
 protected:

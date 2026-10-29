@@ -19,6 +19,8 @@
 
 #include "ob_i_sparse_retrieval_iter.h"
 #include "ob_sparse_utils.h"
+#include "lib/charset/ob_charset.h"
+#include "common/object/ob_obj_type.h"
 #include "storage/access/ob_scan_merge_loser_tree.h"
 #include "storage/access/ob_simple_rows_merger.h"
 
@@ -46,14 +48,18 @@ struct ObSRMergeCmp
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
 private:
-  inline const ObDatum &get_id_datum(const int64_t iter_idx)
+  inline const ObDatum *get_id_datum(const int64_t iter_idx) const
   {
-    const ObDatum *datum = iter_ids_->at(iter_idx);
-    OB_ASSERT(nullptr != datum);
-    return *datum;
+    const ObDatum **data = iter_ids_->get_data();
+    OB_ASSERT(nullptr != data);
+    OB_ASSERT(nullptr != data[iter_idx]);
+    return data[iter_idx];
   }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  // Collation handle for string doc ids. It is initialized once because the
+  // doc ids of one merge are compared on every heap operation.
+  const ObCharsetInfo *cs_;
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
@@ -105,6 +111,11 @@ protected:
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
+  // Cached raw views of the arrays above. They are fixed in init() and only the
+  // element values change, so the hot merge loop can index them directly.
+  const double *dim_weights_data_;
+  ObDocIdExt *buffered_domain_ids_data_;
+  double *buffered_relevances_data_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);

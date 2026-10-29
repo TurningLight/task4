@@ -67,6 +67,9 @@ public:
   int resolve_convert_to_character(const ParseNode &node);
   int resolve_foreign_key_options(const ParseNode &node);
   int resolve_add_column(const ParseNode &node, ObColumnNameSet &resolve_add_column);
+  // Validates the AI COLUMN declarations among the added columns and appends the maintenance
+  // columns they need.
+  int resolve_ai_columns();
   int resolve_alter_column(const ParseNode &node);
   int resolve_change_column(const ParseNode &node);
   int check_modify_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,

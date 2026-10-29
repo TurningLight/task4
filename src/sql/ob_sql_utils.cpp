@@ -3360,6 +3360,19 @@ bool ObSQLUtils::is_online_stat_gathering_nested_sql(ObExecContext *cur_ctx)
   return bret;
 }
 
+//this sql is triggered by the ai column maintenance of a dml statement
+static bool is_ai_column_nested_sql(ObExecContext *cur_ctx)
+{
+  bool bret = false;
+  if (cur_ctx != nullptr && cur_ctx->get_parent_ctx() != nullptr) {
+    ObSQLSessionInfo *session = cur_ctx->get_my_session();
+    if (OB_NOT_NULL(session) && session->in_ai_column_maintenance()) {
+      bret = true;
+    }
+  }
+  return bret;
+}
+
 bool ObSQLUtils::is_iter_uncommitted_row(ObExecContext *cur_ctx)
 {
   bool bret = false;
@@ -3373,7 +3386,8 @@ bool ObSQLUtils::is_iter_uncommitted_row(ObExecContext *cur_ctx)
 
 bool ObSQLUtils::is_nested_sql(ObExecContext *cur_ctx)
 {
-  return is_pl_nested_sql(cur_ctx) || is_fk_nested_sql(cur_ctx) || is_online_stat_gathering_nested_sql(cur_ctx);
+  return is_pl_nested_sql(cur_ctx) || is_fk_nested_sql(cur_ctx)
+      || is_online_stat_gathering_nested_sql(cur_ctx) || is_ai_column_nested_sql(cur_ctx);
 }
 
 //bind current execute context to my session,
@@ -3395,7 +3409,11 @@ void LinkExecCtxGuard::link_current_context()
     //switch the exec ctx reference in sql session
     session_.set_cur_exec_ctx(&exec_ctx_);
     is_linked_ = true;
-    if (ObSQLUtils::is_nested_sql(&exec_ctx_)) {
+    //The nesting decision is taken once, at link time, and the matching restore at unlink time
+    //must not re-evaluate it: the condition can change while the statement runs, and restoring
+    //an autocommit value that was never saved would turn autocommit off for good.
+    is_nested_ = ObSQLUtils::is_nested_sql(&exec_ctx_);
+    if (is_nested_) {
       //force nested sql to commit as a whole
       //force to set session.autocommit=false
       session_.get_autocommit(is_autocommit_);
@@ -3415,7 +3433,7 @@ void LinkExecCtxGuard::unlink_current_context()
   LOG_DEBUG("unlink current context", K(is_linked_), K(session_.get_cur_exec_ctx()),
            K(&exec_ctx_), K(&session_), K(exec_ctx_.get_parent_ctx()));
   if (is_linked_) {
-    if (ObSQLUtils::is_nested_sql(&exec_ctx_)) {
+    if (is_nested_) {
       //restore the autocommit flag at first
       session_.set_autocommit(is_autocommit_);
     }
