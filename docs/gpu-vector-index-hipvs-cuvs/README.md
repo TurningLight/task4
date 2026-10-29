@@ -11,8 +11,10 @@ For GPU-accelerated **snapshot construction** with native VSAG query and persist
 see [Build native HNSW snapshots with hipVS](bulk_hnsw_build.md). That opt-in path
 automatically discovers its worker next to seekdb; `SEEKDB_HIPVS_BUILD_WORKER`
 is an optional override. It has separate build-time evidence and benchmarks.
-See the [2026-10-29 construction experiment report](bulk_hnsw_experiment_2026-10-29.md)
-for repeated end-to-end measurements, recall checks and GPU execution evidence.
+See the [v2 offline/default-build verification report](bulk_hnsw_offline_v2_2026-10-29.md)
+for the latest repeated measurements, Rust/build checks and GPU execution evidence.
+The [original construction experiment report](bulk_hnsw_experiment_2026-10-29.md)
+retains the earlier manually configured version's measurements.
 The lazy GPU query path described below is retained when no worker is available
 or `SEEKDB_HIPVS_BUILD_WORKER` is explicitly set to an empty value.
 

@@ -1,0 +1,13 @@
+{
+  "full_logs_published": false,
+  "public_metrics_match_private_originals": true,
+  "public_json_files_checked": 10,
+  "credential_or_host_identifier_pattern_matches": 0,
+  "removed_from_publication": [
+    "full environment snapshot",
+    "full startup and build logs",
+    "unfiltered construction logs",
+    "raw profiler files"
+  ],
+  "private_backup_file_count": 61
+}

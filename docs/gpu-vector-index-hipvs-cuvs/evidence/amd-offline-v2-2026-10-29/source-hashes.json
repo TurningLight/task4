@@ -1,0 +1,30 @@
+{
+  "base_commit": "71e69003169ce5e5dbae3ca2a34681e5789c98dc",
+  "files": {
+    "CMakeLists.txt": "6fe7084ea019bd45379a4083ce15384c6bd3ac085d105319c178d1510d22203f",
+    "build.sh": "1960d183e256fe1ae4708437501140a36c67c16bdd1f2d4990ab3203c78b79f4",
+    "cmake/Env.cmake": "6f8822f024bea6c02b8124291df98fc6f8b98d6fa2975259b2ed804c778a37ca",
+    "cmake/HipvsConfig.cmake": "7f10e39a0e63de7bf7359b3ffd6cd2831111e9affa33baa5fc1bd9f2c0bc03f8",
+    "cmake/HipvsWorker.cmake": "f47ca901722abb7d059b67537ba8b36ecede357e48866cc506381293119245ef",
+    "cmake/Rust.cmake": "f6e89cdcfaac437dd1b8ab03ab14643e32ddade0c9456d3456a577a952efa4af",
+    "rust/.gitignore": "ede0a461119a78fdd9938864d96e37889bfce804a7dc26a1b88fd02393c501a5",
+    "rust/Cargo.lock": "111cfad3bb928d5ccac3ae1dfaf43e0865a33123af6f2629186b433ea965b99e",
+    "rust/sql-nio/src/cert.rs": "1c82d72b4498bbf7bbc5e9bf9a67c11848ed501dec64bcf2d3c7b5a612bc4b8d",
+    "rust/sql-nio/src/request.rs": "cb747074227eb09f6577f4e395c43ccc196b3d19d63ee74d01cf3fd5dc38ad99",
+    "rust/sql-nio/src/stmt_execute.rs": "aa8e0f44de73efdb00ba4fcc6a887a8444bf1304ca2d85eba0bda0fa16e1b3df",
+    "rust/sql-nio/src/tls.rs": "796047d8f652ec9c44843ff065105bf840337085e5fe3c16134567f62e7ee6ad",
+    "src/oblib/lib/vector/hipvs_bulk_builder.cpp": "07f439ce7ed5e098532334f1cedc749ec4ba3fdd225db0e3378834d46568e3d1",
+    "src/oblib/lib/vector/hipvs_bulk_builder.h": "80ecaa7ef10ee606457f1bf5801e42a6e8f5af5e59e92ad3baad553f041c46b1",
+    "src/oblib/lib/vector/ob_vsag_adaptor.cpp": "ee87217f1f29971fa4fc9f68e99999cb35da8a75a63f9002104f9fa5c28ce005",
+    "src/oblib/lib/vector/ob_vsag_adaptor.h": "5dbb771d0cd7c1987836d4faee5fff99e769df8c682d9402cfbc8f7234e5c78f",
+    "src/oblib/oblib_header_inventory.bzl": "e240188ed729ffb49a48f7f9d980a4e72fbf2380b4bcf32bea3ad647ac6d406d",
+    "src/oblib/oblib_source_inventory.bzl": "aa77c9041321d9f0fa1c14360b17293bc466059ab29d81e6ca84b5886813f07a",
+    "src/observer/vector_index/ob_plugin_vector_index_adaptor.cpp": "229987454f2d5d7fdbdb1585241cf646d9da07ea9243fc5b9e8dab841f1a5102",
+    "src/observer/vector_index/ob_plugin_vector_index_utils.cpp": "98137973af0d78fbfdda7441acd468ff6dd84733cb340595cf9d3b5e1ba9da42",
+    "src/query/api/query/vector/ob_vector_index_adaptor.h": "9919362884409f11e51d99b0bc422dc3c3bbe84db2874b11cd3211e5e2c68540",
+    "tools/hipvs_bridge/build_hnsw_worker.sh": "c516eaf7b4d86fe14542531e9347c05e76209dfc266c59929d9b51acd17b7106",
+    "tools/hipvs_bridge/hnsw_build_worker.cpp": "37544b8c7da9c18f1429137d134ce8cad473fb07529d596856e0347f59fbe75b",
+    "tools/hipvs_bridge/hnsw_hierarchy.h": "c551863d5febd7c5939ede3ff896ef2ba627233965df2207f378c6cb590dc835",
+    "tools/hipvs_bridge/run_vector_tests.sh": "fb286ce3ec09eb520aa14b9c25f06ff43a534cd9790b20111c1a5122e51d744f"
+  }
+}

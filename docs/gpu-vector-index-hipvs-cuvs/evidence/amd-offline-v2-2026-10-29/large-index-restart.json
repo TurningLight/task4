@@ -1,0 +1,12 @@
+[
+  {
+    "scale": "100k",
+    "ids_identical": true,
+    "returned": 10
+  },
+  {
+    "scale": "500k",
+    "ids_identical": true,
+    "returned": 10
+  }
+]

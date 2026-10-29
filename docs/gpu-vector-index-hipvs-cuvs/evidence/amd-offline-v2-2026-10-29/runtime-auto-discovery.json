@@ -1,0 +1,6 @@
+{
+  "worker_override_present": false,
+  "library_path_override_present": false,
+  "worker_sha256": "a9c804473811b985304e36af8bdd6a589c6878364603d86e88bc6fe8d499d0b9",
+  "worker_location": "next to the running seekdb executable"
+}

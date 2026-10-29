@@ -1,0 +1,10 @@
+{
+  "100k": {
+    "kernel_trace": 158,
+    "memory_copy_trace": 201
+  },
+  "500k": {
+    "kernel_trace": 14722,
+    "memory_copy_trace": 493
+  }
+}

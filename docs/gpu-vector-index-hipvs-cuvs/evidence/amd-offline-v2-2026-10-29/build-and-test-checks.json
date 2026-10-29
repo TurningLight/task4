@@ -1,0 +1,28 @@
+{
+  "default_build_command": "./build.sh release --init --make -j8",
+  "default_build_result": "passed",
+  "configuration_events": [
+    "-- [hipVS] preinstalled=ON; enabled=ON; worker=ON; offline=ON",
+    "-- [rust] locked offline build; missing cached dependencies fail without download"
+  ],
+  "image_rust_version": "1.97.1",
+  "image_rust_tests_passed": 5,
+  "local_rust_version": "1.99.1",
+  "local_clippy_deny_warnings": "passed",
+  "build_integration_tests_passed": 5,
+  "python_tests_passed": 17,
+  "cpu_and_gpu_sql_regressions": "passed",
+  "restart_without_gpu_or_worker": "passed",
+  "source_log_sha256": {
+    "amd-v2-default-build.log": "2c5d83429bfc2167e0671c9f9c144c514c0259ed19d54c0045ade019bceac4e5",
+    "amd-v2-before-lock.log": "2dfc404205ee02a808f2bf1060f67f601df5171352104658a9b369bf7ac939ef",
+    "amd-v2-rust-test-fixed.log": "d48edc5bc2b3d709be4f75738e4ca83bb490646653cc4818e08bd78bbc9512f5",
+    "clippy-local-rust-1.99.1.log": "1021af7868946f827ffee5e924fbe5654160eb2b4f15a6c7652c614171a3a1d0",
+    "amd-v2-build-integration.log": "70ca37314fe82d49a6235b9156e3f6c89ff8b538c6770ad9838840f7895bbc2a",
+    "python-tests.log": "df0891d9ff7feb8d25cb43d4110da2896ce6460adb2bdc351685befa2e5f750d",
+    "sql-regressions.log": "fce2a68f4af871f60983c1fcaee4ab2fcd0acee600b133aad2673c8568f1a469",
+    "cpu-sql-regressions.log": "b34fba48cf019aa5ac9c162d25e33538b457955b799e58351ca54f5348d05a59",
+    "restart-verification.log": "7fe3af9e8be3cd9db974548f7d4583a79f9d487e4d0647158692be2fbf72a4bb"
+  },
+  "publication_note": "Only validation results and non-identifying configuration excerpts are public. Full build/environment/startup logs remain in the verified local backup."
+}

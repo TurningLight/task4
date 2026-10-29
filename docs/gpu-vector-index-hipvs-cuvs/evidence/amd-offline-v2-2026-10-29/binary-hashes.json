@@ -1,0 +1,7 @@
+{
+  "cpu_baseline": "74dc22b805519dcff14bc1dfe1928bdfe351e0b7feeb8a993797173380e80bee",
+  "candidate_seekdb": "de4fa9bb3c46a5f01feacbd257eb2aea8775ccb39ebb1d40b8b66043e9b82fbe",
+  "gpu_worker": "a9c804473811b985304e36af8bdd6a589c6878364603d86e88bc6fe8d499d0b9",
+  "hipvs_library": "5ccf012af5923c687cd2d22149740a410ca69e0aa51223a6386ba6fc129c967a",
+  "hipvs_c_api": "b63211897276e0a6911bb534fe77c8b0b59f31c50af1df2f108845f06ad46ebf"
+}
