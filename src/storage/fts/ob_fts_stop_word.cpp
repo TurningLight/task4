@@ -127,6 +127,7 @@ ObAddWord::ObAddWord(
     common::ObIAllocator &allocator,
     ObFTWordMap &word_map)
   : word_meta_(meta),
+    map_word_meta_(meta),
     allocator_(allocator),
     word_map_(word_map),
     min_max_word_cnt_(0),
@@ -136,6 +137,15 @@ ObAddWord::ObAddWord(
     max_token_size_(property.max_token_size_),
     flag_(flag)
 {
+  // 解析器已经做过 casedown 时，词元之间的大小写差异已经被消除，
+  // 再用大小写不敏感的排序规则去哈希和比较只会多走一遍逐字符的多字节转换。
+  // 这种情况下下降到二进制比较：折叠之后的词元在两种比较下等价，
+  // 但二进制比较不需要逐字符转换，是分词热路径上的一处明显开销。
+  if (flag_.casedown()
+      && CHARSET_UTF8MB4 == meta.get_charset_type()
+      && CS_TYPE_UTF8MB4_BIN != meta.get_collation_type()) {
+    map_word_meta_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+  }
 }
 
 int ObAddWord::process_word(
@@ -211,17 +221,23 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
   int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (!flag_.groupby_word()) {
-    if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
-    }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
+    // 词元入表时用 map_word_meta_（解析器做过 casedown 时是二进制排序规则），
+    // 让哈希与比较不再走逐字符的多字节转换。
+    const ObString word_str = word.get_word().get_string();
+    ObFTWord map_word(word_str.length(), word_str.ptr(), map_word_meta_);
+    if (!flag_.groupby_word()) {
+      if (OB_FAIL(word_map_.set_refactored(map_word, 1/*word count*/))) {
+      }
+    } else if (OB_FAIL(word_map_.get_refactored(map_word, word_count)) && OB_HASH_NOT_EXIST != ret) {
     } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        word_count = 1;
+      } else {
+        word_count += word_freq;
+      }
+      if (OB_FAIL(word_map_.set_refactored(map_word, word_count, 1/*overwrite*/))) {
+      }
     }
   }
   return ret;
