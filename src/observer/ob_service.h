@@ -73,6 +73,70 @@ public:
   int report();
 };
 
+// Polls __all_ai_column_task and drives asynchronous AI column generation.
+class ObAiColumnWorkerTask : public common::ObTimerTask
+{
+public:
+  static const int64_t POLL_INTERVAL_US = 100L * 1000L;
+  static const int64_t MAX_TASK_BATCH = 64;
+  static const int64_t RETRY_DELAY_US = 1000L * 1000L;
+  static const int64_t RUNNING_STALE_US = 30L * 1000L * 1000L;
+  struct TaskItem
+  {
+    int64_t task_id_;
+    uint64_t table_id_;
+    uint64_t ai_column_id_;
+    int64_t retry_count_;
+    int64_t max_retries_;
+    common::ObString request_id_;
+    common::ObString rowkey_predicate_;
+    common::ObString column_name_;
+    common::ObString normalized_expr_;
+    common::ObString table_name_;
+    common::ObString database_name_;
+    common::ObString state_column_name_;
+    TO_STRING_KV(K_(task_id), K_(table_id), K_(ai_column_id), K_(retry_count),
+                 K_(max_retries), K_(request_id), K_(rowkey_predicate),
+                 K_(column_name), K_(normalized_expr), K_(table_name),
+                 K_(database_name), K_(state_column_name));
+  };
+public:
+  ObAiColumnWorkerTask();
+  virtual ~ObAiColumnWorkerTask() {}
+  int init(common::ObMySQLProxy &sql_proxy);
+  int start();
+  void stop();
+  void wait();
+  void destroy();
+  virtual void runTimerTask() override;
+private:
+  int poll_tasks_(common::ObIAllocator &alloc,
+                  common::ObIArray<TaskItem> &items);
+  int process_group_(common::ObIAllocator &alloc,
+                     common::ObIArray<TaskItem> &items,
+                     const int64_t begin,
+                     const int64_t end);
+  int claim_group_(const TaskItem &item);
+  int fetch_model_values_(common::ObIAllocator &alloc,
+                          common::ObIArray<TaskItem> &items,
+                          const int64_t begin,
+                          const int64_t end,
+                          common::ObIArray<common::ObString> &values,
+                          common::ObIArray<int64_t> &failed,
+                          bool &row_gone);
+  int publish_group_(common::ObIAllocator &alloc,
+                     common::ObIArray<TaskItem> &items,
+                     const int64_t begin,
+                     const int64_t end,
+                     common::ObIArray<common::ObString> &values,
+                     common::ObIArray<int64_t> &failed);
+private:
+  common::ObMySQLProxy *sql_proxy_;
+  common::ObTimer timer_;
+  bool is_inited_;
+  volatile bool stopped_;
+};
+
 class ObService : public rootserver::ObIRootserverLocalRuntime,
                   public query::ObILocalCommandService
 {
@@ -177,6 +241,7 @@ private:
   query::ObIChangeStreamService &change_stream_service_;
   ObSchemaReleaseTimeTask schema_release_task_;
   TelemetryTask telemetry_task_;
+  ObAiColumnWorkerTask ai_column_worker_task_;
 };
 
 }//end namespace observer

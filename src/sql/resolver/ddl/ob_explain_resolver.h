@@ -33,6 +33,13 @@ namespace sql
     virtual ~ObExplainResolver() {}
     virtual int resolve(const ParseNode &parse_tree);
     ObExplainStmt *get_explain_stmt();
+    // DuckDB style `DESCRIBE <select>` over a file table: the inferred schema is
+    // known at resolve time, so the column metadata is produced here as a small
+    // values table. `handled` stays false (keep MySQL EXPLAIN behaviour) whenever
+    // the inner stmt is not a plain projection over a single file table.
+    int resolve_file_table_describe(ObStmt &child_stmt, bool &handled);
+    int build_file_table_describe(ObSelectStmt &child,
+                                  common::ObIArray<ObJtColBaseInfo *> &cols);
     int resolve_columns(ObRawExpr *&expr, common::ObArray<ObQualifiedName> &columns)
     {
       UNUSED(expr);

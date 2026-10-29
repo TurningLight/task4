@@ -751,6 +751,142 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+
+namespace
+{
+int translate_retry_ai_predicate(const ObString &input,
+                                  const ObString &state_column_name,
+                                  ObSqlString &output)
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+  const int64_t len = input.length();
+  while (OB_SUCC(ret) && pos < len) {
+    const char c = input.ptr()[pos];
+    if ('\'' == c || '"' == c) {
+      const char quote = c;
+      const int64_t start = pos++;
+      bool closed = false;
+      while (!closed && pos < len) {
+        if (input[pos] == quote) {
+          if (pos + 1 < len && input[pos + 1] == quote) {
+            pos += 2;
+          } else {
+            ++pos;
+            closed = true;
+          }
+        } else if ('\\' == input[pos] && pos + 1 < len) {
+          pos += 2;
+        } else {
+          ++pos;
+        }
+      }
+      if (OB_FAIL(output.append_fmt("%.*s", static_cast<int32_t>(pos - start),
+                                    input.ptr() + start))) {
+      }
+    } else if ('`' == c) {
+      const int64_t start = pos++;
+      while (pos < len && '`' != input[pos]) {
+        ++pos;
+      }
+      if (pos < len) {
+        ++pos;
+      }
+      if (OB_FAIL(output.append_fmt("%.*s", static_cast<int32_t>(pos - start),
+                                    input.ptr() + start))) {
+      }
+    } else if (isalpha(static_cast<unsigned char>(c)) || '_' == c || '$' == c) {
+      const int64_t start = pos;
+      while (pos < len && (isalnum(static_cast<unsigned char>(input[pos]))
+                           || '_' == input[pos] || '$' == input[pos])) {
+        ++pos;
+      }
+      ObString ident(static_cast<int32_t>(pos - start), input.ptr() + start);
+      if (0 == ident.case_compare("status")) {
+        if (OB_FAIL(output.append_fmt("`%.*s`",
+                   static_cast<int32_t>(state_column_name.length()),
+                   state_column_name.ptr()))) {
+        }
+      } else if (OB_FAIL(output.append_fmt("%.*s", static_cast<int32_t>(ident.length()),
+                                           ident.ptr()))) {
+      }
+    } else {
+      if (OB_FAIL(output.append_fmt("%c", c))) {
+      }
+      ++pos;
+    }
+  }
+  return ret;
+}
+}  // namespace
+
+int execute_retry_ai_column(ObExecContext &ctx, const obcall::ObAlterTableArg &arg)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard runtime_guard;
+  const ObTableSchema *table_schema = nullptr;
+  const ObDatabaseSchema *database_schema = nullptr;
+  const ObColumnSchemaV2 *ai_column = nullptr;
+  const ObColumnSchemaV2 *state_column = nullptr;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(GCTX.schema_service_)
+      || OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(runtime_guard))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(runtime_guard.get_table_schema(arg.table_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_FAIL(runtime_guard.get_database_schema(table_schema->get_database_id(),
+                                                       database_schema))) {
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(ai_column = table_schema->get_column_schema(
+                           arg.retry_ai_column_name_))
+             || !ai_column->is_ai_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+  } else {
+    if (OB_INVALID_ID != ai_column->get_ai_state_column_id()) {
+      state_column = table_schema->get_column_schema(ai_column->get_ai_state_column_id());
+    }
+    if (OB_ISNULL(state_column)) {
+      ObSqlString state_name;
+      if (OB_FAIL(state_name.assign_fmt("%.*s_ai_state",
+                 static_cast<int32_t>(ai_column->get_column_name_str().length()),
+                 ai_column->get_column_name_str().ptr()))) {
+      } else {
+        state_column = table_schema->get_column_schema(state_name.string());
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(sql.assign_fmt("update `%.*s`.`%.*s` set `%.*s` = null",
+           static_cast<int32_t>(database_schema->get_database_name_str().length()),
+           database_schema->get_database_name_str().ptr(),
+           static_cast<int32_t>(table_schema->get_table_name_str().length()),
+           table_schema->get_table_name_str().ptr(),
+           static_cast<int32_t>(ai_column->get_column_name_str().length()),
+           ai_column->get_column_name_str().ptr()))) {
+    } else if (!arg.retry_ai_column_where_.empty()) {
+      ObSqlString translated;
+      if (OB_FAIL(translate_retry_ai_predicate(arg.retry_ai_column_where_,
+                   OB_ISNULL(state_column) ? ObString() : state_column->get_column_name_str(),
+                   translated))) {
+      } else if (OB_FAIL(sql.append_fmt(" %.*s",
+                 static_cast<int32_t>(translated.length()), translated.ptr()))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_INFO("retry ai column", K(sql));
+    if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
+    } else {
+      LOG_INFO("retry ai column done", K(affected_rows));
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -758,6 +894,9 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();
   ObString first_stmt;
+  if (alter_table_arg.is_retry_ai_column_) {
+    return execute_retry_ai_column(ctx, alter_table_arg);
+  }
   OZ (stmt.get_first_stmt(first_stmt));
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {

@@ -52,6 +52,19 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  // Fused ObCharset::first_valid_char + classify_first_char: resolves one character length
+  // through a cached well_formed_len function pointer, then classifies the same bytes. Saves a
+  // per-character collation->charset lookup on the tokenizer hot path.
+  static int classify_first_valid_char(ObCharsetType cs_type,
+                                       const char *buf,
+                                       int64_t buf_size,
+                                       size_t (*well_formed_len_fn)(const struct ObCharsetInfo *,
+                                                                   const char *, const char *,
+                                                                   size_t, int *),
+                                       const ObCharsetInfo *cs,
+                                       int64_t &char_len,
+                                       CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -495,6 +508,58 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
     ret = OB_NOT_SUPPORTED;
     STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
     break;
+  }
+  return ret;
+}
+
+
+// Fused replacement for (ObCharset::first_valid_char + classify_first_char): resolves the
+// character length through a cached well_formed_len function pointer and classifies the same
+// bytes in one pass, avoiding a per-character collation->charset lookup.
+inline int ObFTCharUtil::classify_first_valid_char(ObCharsetType cs_type,
+                                        const char *buf,
+                                        int64_t buf_size,
+                                        size_t (*well_formed_len_fn)(const struct ObCharsetInfo *,
+                                                                    const char *, const char *,
+                                                                    size_t, int *),
+                                        const ObCharsetInfo *cs,
+                                        int64_t &char_len,
+                                        ObFTCharUtil::CharType &type)
+{
+  int ret = OB_SUCCESS;
+  char_len = 0;
+  type = ObFTCharUtil::CharType::USELESS;
+  if (OB_UNLIKELY(nullptr == buf)) {
+    ret = OB_NOT_INIT;
+  } else if (buf_size <= 0) {
+    // mirror ObCharset::first_valid_char: nothing left, keep char_len == 0
+  } else if (OB_ISNULL(cs) || OB_ISNULL(well_formed_len_fn)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    int error = 0;
+    const int64_t len = static_cast<int64_t>(well_formed_len_fn(cs, buf, buf + buf_size, 1, &error));
+    if (OB_UNLIKELY(0 != error)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_UNLIKELY(len <= 0 || len > static_cast<int64_t>(UINT8_MAX))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      char_len = len;
+      const uint8_t u8_len = static_cast<uint8_t>(len);
+      switch (cs_type) {
+      case CHARSET_UTF8MB4:
+        ret = ObFTCharUtil::do_classify<CHARSET_UTF8MB4>(buf, u8_len, type);
+        break;
+      case CHARSET_UTF16:
+        ret = ObFTCharUtil::do_classify<CHARSET_UTF16>(buf, u8_len, type);
+        break;
+      case CHARSET_UTF16LE:
+        ret = ObFTCharUtil::do_classify<CHARSET_UTF16LE>(buf, u8_len, type);
+        break;
+      default:
+        ret = OB_NOT_SUPPORTED;
+        break;
+      }
+    }
   }
   return ret;
 }

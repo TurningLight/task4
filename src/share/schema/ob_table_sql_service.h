@@ -18,6 +18,7 @@
 #define OCEANBASE_SHARE_SCHEMA_OB_TABLE_SQL_SERVICE_H_
 
 #include "ob_ddl_sql_service.h"
+#include "share/schema/ob_ai_column_sql_service.h"
 
 namespace oceanbase
 {
@@ -555,6 +556,7 @@ public:
   void init(common::ObMySQLProxy *sql_proxy) { sql_proxy_ = sql_proxy; }
 private:
   common::ObMySQLProxy *sql_proxy_;
+  ObAiColumnSqlService ai_column_sql_service_;
   ObMultiVersionSchemaService &multi_version_schema_service_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTableSqlService);

@@ -20,6 +20,7 @@
 #include "lib/allocator/ob_allocator.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "storage/fts/ik/ob_fast_segment_array.h"
 #include "storage/fts/ik/ob_ik_char_util.h"
 #include "storage/fts/ik/ob_ik_token.h"
 
@@ -45,8 +46,9 @@ public:
 
   int compound(ObIKToken &result);
 
-  int current_char(const char *&ch, uint8_t &char_len);
-  int current_char_type(ObFTCharUtil::CharType &type);
+  int current_char_and_type(const char *&ch,
+                            uint8_t &char_len,
+                            ObFTCharUtil::CharType &type);
 
   int step_next();
 
@@ -69,7 +71,17 @@ public:
 
   ObFTSortList &token_list() { return token_list_; }
 
-  ObList<ObIKToken, ObIAllocator> &result_list() { return result_list_; }
+  ObFastSegmentArray<ObIKToken> &results() { return results_; }
+
+  // fused first_valid_char + classify using the cached charset facts
+  int classify_first_valid_char(const char *buf,
+                               int64_t buf_size,
+                               int64_t &char_len,
+                               ObFTCharUtil::CharType &type)
+  {
+    return ObFTCharUtil::classify_first_valid_char(cs_type_, buf, buf_size,
+                                                   well_formed_len_fn_, cs_, char_len, type);
+  }
 
   int32_t handle_size() const { return handle_size_; }
 
@@ -84,11 +96,20 @@ private:
   int64_t next_char_len_;
   ObFTCharUtil::CharType next_char_type_;
 
+  // cached per-context charset facts: avoids a collation->charset lookup per character
+  ObCharsetType cs_type_;
+  const ObCharsetInfo *cs_;
+  size_t (*well_formed_len_fn_)(const struct ObCharsetInfo *, const char *, const char *,
+                                size_t, int *);
+
   uint32_t handle_size_;
   bool is_smart_;
 
   ObFTSortList token_list_;
-  ObList<ObIKToken, ObIAllocator> result_list_;
+  // chunked storage: results are appended per batch and consumed by index, so no linked-list
+  // node allocation happens per token
+  ObFastSegmentArray<ObIKToken> results_;
+  int64_t result_idx_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(TokenizeContext);

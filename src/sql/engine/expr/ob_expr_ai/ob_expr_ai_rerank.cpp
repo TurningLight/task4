@@ -24,6 +24,172 @@
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
 
+namespace
+{
+// Read any JSON number node as double without relying on the concrete node type.
+int json_number_to_double(oceanbase::common::ObJsonNode *node, double &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (oceanbase::common::ObJsonNodeType::J_INT == node->json_type()) {
+    value = static_cast<double>(node->get_int());
+  } else if (oceanbase::common::ObJsonNodeType::J_UINT == node->json_type()) {
+    value = static_cast<double>(node->get_uint());
+  } else if (oceanbase::common::ObJsonNodeType::J_DOUBLE == node->json_type()
+             || oceanbase::common::ObJsonNodeType::J_DECIMAL == node->json_type()) {
+    value = node->get_double();
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
+// Read any JSON number node as int64. Returns false when the node is absent or
+// not a number, so callers can fall back to the response order.
+bool json_int_value(oceanbase::common::ObJsonNode *node, int64_t &value)
+{
+  bool found = false;
+  if (OB_NOT_NULL(node)) {
+    if (oceanbase::common::ObJsonNodeType::J_INT == node->json_type()) {
+      value = node->get_int();
+      found = true;
+    } else if (oceanbase::common::ObJsonNodeType::J_UINT == node->json_type()) {
+      value = static_cast<int64_t>(node->get_uint());
+      found = true;
+    } else if (oceanbase::common::ObJsonNodeType::J_DOUBLE == node->json_type()
+               || oceanbase::common::ObJsonNodeType::J_DECIMAL == node->json_type()) {
+      value = static_cast<int64_t>(node->get_double());
+      found = true;
+    }
+  }
+  return found;
+}
+
+bool json_string_equal(oceanbase::common::ObJsonNode *lhs, oceanbase::common::ObJsonNode *rhs)
+{
+  bool equal = false;
+  if (OB_NOT_NULL(lhs) && OB_NOT_NULL(rhs)
+      && oceanbase::common::ObJsonNodeType::J_STRING == lhs->json_type()
+      && oceanbase::common::ObJsonNodeType::J_STRING == rhs->json_type()) {
+    equal = static_cast<oceanbase::common::ObJsonString *>(lhs)->get_str()
+            == static_cast<oceanbase::common::ObJsonString *>(rhs)->get_str();
+  }
+  return equal;
+}
+
+// Rank key of one rerank result element. Elements that are not JSON objects, or
+// that carry no numeric score, are unranked: they keep the provider order and
+// are placed after the ranked elements instead of failing or crashing.
+struct RerankElemKey
+{
+  bool ranked_;
+  bool has_index_;
+  double score_;
+  int64_t index_;
+};
+
+void get_rerank_elem_key(oceanbase::common::ObJsonNode *node,
+                         const oceanbase::common::ObString &score_key,
+                         const oceanbase::common::ObString &index_key,
+                         RerankElemKey &key)
+{
+  key.ranked_ = false;
+  key.has_index_ = false;
+  key.score_ = 0.0;
+  key.index_ = 0;
+  if (OB_NOT_NULL(node) && oceanbase::common::ObJsonNodeType::J_OBJECT == node->json_type()) {
+    oceanbase::common::ObJsonObject *obj =
+        static_cast<oceanbase::common::ObJsonObject *>(node);
+    double score = 0.0;
+    int64_t index = 0;
+    if (OB_SUCCESS == json_number_to_double(obj->get_value(score_key), score)) {
+      key.ranked_ = true;
+      key.score_ = score;
+      if (json_int_value(obj->get_value(index_key), index)) {
+        key.has_index_ = true;
+        key.index_ = index;
+      }
+    }
+  }
+}
+
+// True when lhs has to be ranked strictly before rhs: higher score first, then
+// smaller original document index. Unranked elements compare equal so they keep
+// whatever order they arrived in.
+bool rerank_elem_before(const RerankElemKey &lhs, const RerankElemKey &rhs)
+{
+  bool before = false;
+  if (lhs.ranked_ != rhs.ranked_) {
+    before = lhs.ranked_;
+  } else if (!lhs.ranked_) {
+    before = false;
+  } else if (lhs.score_ != rhs.score_) {
+    before = lhs.score_ > rhs.score_;
+  } else if (lhs.has_index_ && rhs.has_index_ && lhs.index_ != rhs.index_) {
+    before = lhs.index_ < rhs.index_;
+  }
+  return before;
+}
+
+// Stable selection sort of one batch by rank key. A single batch used to be
+// returned in raw provider order while several batches were merged by score, so
+// the same input produced different orders depending on batch_size. Every batch
+// is ordered first, which makes both cases produce one global order.
+int sort_rerank_batch_by_score(oceanbase::common::ObIAllocator &allocator,
+                               oceanbase::common::ObJsonArray *batch_array,
+                               const oceanbase::common::ObString &score_key,
+                               const oceanbase::common::ObString &index_key,
+                               oceanbase::common::ObJsonArray *&sorted_array)
+{
+  int ret = oceanbase::common::OB_SUCCESS;
+  oceanbase::common::ObJsonArray *result_array = nullptr;
+  if (OB_ISNULL(batch_array)) {
+    ret = oceanbase::common::OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(oceanbase::common::ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
+  } else {
+    const int64_t count = batch_array->element_count();
+    char *used = nullptr;
+    if (count > 0 && OB_ISNULL(used = static_cast<char *>(allocator.alloc(count)))) {
+      ret = oceanbase::common::OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      if (count > 0) {
+        memset(used, 0, static_cast<size_t>(count));
+      }
+      for (int64_t picked = 0; OB_SUCC(ret) && picked < count; picked++) {
+        int64_t best = -1;
+        for (int64_t i = 0; i < count; i++) {
+          if (0 == used[i]) {
+            if (best < 0) {
+              best = i;
+            } else {
+              RerankElemKey cur_key;
+              RerankElemKey best_key;
+              get_rerank_elem_key(batch_array->get_value(i), score_key, index_key, cur_key);
+              get_rerank_elem_key(batch_array->get_value(best), score_key, index_key, best_key);
+              if (rerank_elem_before(cur_key, best_key)) {
+                best = i;
+              }
+            }
+          }
+        }
+        if (best < 0) {
+          ret = oceanbase::common::OB_ERR_UNEXPECTED;
+        } else {
+          used[best] = 1;
+          if (OB_FAIL(result_array->append(batch_array->get_value(best)))) {
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    sorted_array = result_array;
+  }
+  return ret;
+}
+}  // namespace
+
 namespace oceanbase 
 {
 namespace sql 
@@ -124,6 +290,10 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
     ObIJsonBase *j_base = nullptr;
     int64_t batch_size = 20; // max batch size for rerank
     bool is_null_result = false;
+    // A SQL NULL doc_key means "no key was supplied", so the documents array is
+    // read as plain strings. Treating the NULL datum as present made the string
+    // form unusable and rejected it with "element is not object".
+    const bool has_doc_key = OB_NOT_NULL(arg_doc_key) && !arg_doc_key->is_null();
     if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, DOCUMENTS_IDX,
           j_base, is_null_result))) {
     } else if (OB_ISNULL(j_base)) {
@@ -141,10 +311,10 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         ObJsonNode *doc_node = document_array->get_value(i);
         if (OB_ISNULL(doc_node)) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_NOT_NULL(arg_doc_key) && doc_node->json_type() != ObJsonNodeType::J_OBJECT) {
+        } else if (has_doc_key && doc_node->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array element is not object");
-        } else if (OB_ISNULL(arg_doc_key) && doc_node->json_type() != ObJsonNodeType::J_STRING) {
+        } else if (!has_doc_key && doc_node->json_type() != ObJsonNodeType::J_STRING) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, document_array element is not string");
         }
@@ -160,7 +330,7 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
     } 
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_doc_key)) {
+    } else if (has_doc_key) {
       ObString doc_key = arg_doc_key->get_string();
       if (OB_FAIL(eval_ai_rerank_with_doc_key(expr, ctx, temp_allocator, model_id,
                   query, document_array, doc_key, *info, *endpoint_info, res))) {
@@ -175,9 +345,11 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
 
       if (OB_SUCC(ret)) {
         ObString score_key(SCORE_KEY);
+        ObString index_key(INDEX_KEY);
         int64_t end_idx = 0;
         ObJsonArray *compact_array = nullptr;
         ObJsonArray *batch_result_array = nullptr;
+        ObJsonArray *sorted_batch_array = nullptr;
         ObJsonArray *batch_document_array = nullptr;
         for (int64_t i = 0; OB_SUCC(ret) && i < document_array->element_count(); i += batch_size) {
           end_idx = i + batch_size;
@@ -187,7 +359,8 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
           if (OB_FAIL(construct_batch_document_array(temp_allocator, document_array, i, end_idx, batch_document_array))) {
           } else if (OB_FAIL(inner_eval_ai_rerank(temp_allocator, *info, *endpoint_info, header_array, query, batch_document_array, batch_result_array))) {
           } else if (OB_FAIL(batch_result_add_base(temp_allocator, batch_result_array, i))) {
-          } else if (OB_FAIL(compact_json_array_by_key(temp_allocator, result_array, batch_result_array, score_key, compact_array))) {
+          } else if (OB_FAIL(sort_rerank_batch_by_score(temp_allocator, batch_result_array, score_key, index_key, sorted_batch_array))) {
+          } else if (OB_FAIL(compact_json_array_by_key(temp_allocator, result_array, sorted_batch_array, score_key, compact_array))) {
           } else {
             result_array = compact_array;
           }
@@ -217,7 +390,7 @@ int ObExprAIRerank::eval_ai_rerank_with_doc_key(const ObExpr &expr, ObEvalCtx &c
   } else {
     ObAIFuncModel model(allocator, info, endpoint_info);
     if (OB_FAIL(model.call_rerank(query, doc_array, result_array))) {
-    } else if (OB_FAIL(sort_document_array_by_model_result(allocator, document_array, result_array, sorted_document_array))) {
+    } else if (OB_FAIL(sort_document_array_by_model_result(allocator, document_array, result_array, doc_key, sorted_document_array))) {
     } 
   }
   if (OB_SUCC(ret)) {
@@ -273,31 +446,74 @@ int ObExprAIRerank::get_doc_array_from_documents_array_with_key(ObIAllocator &al
   return ret;
 }
 
-int ObExprAIRerank::sort_document_array_by_model_result(ObIAllocator &allocator, ObJsonArray *document_array, ObJsonArray *model_result_array, ObJsonArray *&sorted_document_array)
+int ObExprAIRerank::sort_document_array_by_model_result(ObIAllocator &allocator, ObJsonArray *document_array, ObJsonArray *model_result_array, const ObString &doc_key, ObJsonArray *&sorted_document_array)
 {
   INIT_SUCC(ret);
   ObJsonArray *sorted_document_array_obj = nullptr;
-  if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, sorted_document_array_obj))) {
+  if (OB_ISNULL(document_array) || OB_ISNULL(model_result_array)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, sorted_document_array_obj))) {
   } else {
-    int64_t count = model_result_array->element_count();
+    const int64_t doc_count = document_array->element_count();
+    const int64_t count = model_result_array->element_count();
+    char *used_index = nullptr;
+    if (doc_count > 0 && OB_ISNULL(used_index = static_cast<char *>(allocator.alloc(doc_count)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (doc_count > 0) {
+      memset(used_index, 0, static_cast<size_t>(doc_count));
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
-      ObJsonObject *model_result_obj = static_cast<ObJsonObject *>(model_result_array->get_value(i));
-      if (OB_ISNULL(model_result_obj)) {
+      ObJsonNode *result_node = model_result_array->get_value(i);
+      int64_t index = -1;
+      ObJsonNode *score_node = nullptr;
+      if (OB_ISNULL(result_node) || ObJsonNodeType::J_OBJECT != result_node->json_type()) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        ObJsonInt *index_value = static_cast<ObJsonInt *>(model_result_obj->get_value(INDEX_KEY));
-        ObJsonDouble *score_value = static_cast<ObJsonDouble *>(model_result_obj->get_value(SCORE_KEY));
-        if (OB_ISNULL(index_value) || OB_ISNULL(score_value)) {
+        ObJsonObject *result_obj = static_cast<ObJsonObject *>(result_node);
+        score_node = result_obj->get_value(SCORE_KEY);
+        double score_value = 0.0;
+        if (OB_NOT_NULL(score_node) && OB_SUCCESS != json_number_to_double(score_node, score_value)) {
+          // _model_score has to stay a number; a provider sending the score as
+          // text used to leak that raw text into the result.
+          ret = OB_INVALID_DATA;
+          FORWARD_USER_ERROR(ret, "ai_rerank, relevance_score is not a number");
+        } else if (!json_int_value(result_obj->get_value(INDEX_KEY), index)) {
+          // A provider may echo the ranked documents instead of index/score
+          // pairs; map such an element back through the text value that was
+          // sent for this document key.
+          index = -1;
+          if (!doc_key.empty()) {
+            ObJsonNode *text_node = result_obj->get_value(doc_key);
+            for (int64_t k = 0; -1 == index && k < doc_count; k++) {
+              ObJsonNode *origin_node = document_array->get_value(k);
+              if (OB_NOT_NULL(origin_node) && ObJsonNodeType::J_OBJECT == origin_node->json_type()
+                  && json_string_equal(static_cast<ObJsonObject *>(origin_node)->get_value(doc_key), text_node)) {
+                index = k;
+              }
+            }
+          }
+          if (-1 == index && i < doc_count) {
+            // Last resort: keep the response order.
+            index = i;
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (index < 0 || index >= doc_count) {
           ret = OB_ERR_UNEXPECTED;
+        } else if (0 != used_index[index]) {
+          // Answering one document twice would emit it twice and break the
+          // count / original id mapping, so the response is rejected.
+          ret = OB_INVALID_DATA;
+          FORWARD_USER_ERROR(ret, "ai_rerank, duplicated index in model result");
         } else {
-          int64_t index = index_value->value();
+          used_index[index] = 1;
           ObJsonObject *origin_obj = static_cast<ObJsonObject *>(document_array->get_value(index));
           ObJsonObject *new_obj = nullptr;
           if (OB_ISNULL(origin_obj)) {
             ret = OB_ERR_UNEXPECTED;
           } else if (OB_ISNULL(new_obj = static_cast<ObJsonObject *>(origin_obj->clone(&allocator, true)))) {
             ret = OB_ERR_UNEXPECTED;
-          } else if (OB_FAIL(new_obj->add(MODEL_SCORE_KEY, score_value))) {
+          } else if (OB_NOT_NULL(score_node) && OB_FAIL(new_obj->add(MODEL_SCORE_KEY, score_node))) {
           } else if (OB_FAIL(sorted_document_array_obj->append(new_obj))) {
           }
         }
@@ -361,16 +577,32 @@ int ObExprAIRerank::batch_result_add_base(ObIAllocator &allocator, ObJsonArray *
   int64_t count = array->element_count();
   ObString index_key(INDEX_KEY);
   for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
-    ObJsonObject *obj = static_cast<ObJsonObject *>(array->get_value(i));
-    if (OB_ISNULL(obj)) {
+    ObJsonNode *node = array->get_value(i);
+    if (OB_ISNULL(node)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (ObJsonNodeType::J_OBJECT != node->json_type()) {
+      // The provider echoed the ranked documents as plain values; there is no
+      // index field to shift and the array order already is the ranked order.
     } else {
-      ObJsonInt *int_obj = static_cast<ObJsonInt *>(obj->get_value(index_key));
-      if (OB_ISNULL(int_obj)) {
-        ret = OB_ERR_UNEXPECTED;
+      ObJsonObject *result_obj = static_cast<ObJsonObject *>(node);
+      ObJsonNode *index_node = result_obj->get_value(index_key);
+      int64_t index = 0;
+      if (OB_ISNULL(index_node)) {
+        // No index in the response: keep the provider order.
+      } else if (!json_int_value(index_node, index)) {
+        ret = OB_INVALID_DATA;
+        FORWARD_USER_ERROR(ret, "ai_rerank, result index is not a number");
+      } else if (index + start_idx < 0) {
+        ret = OB_INVALID_DATA;
+        FORWARD_USER_ERROR(ret, "ai_rerank, result index is out of range");
       } else {
-        int64_t id = int_obj->value() + start_idx;
-        int_obj->set_value(id);
+        // Store the global position as a plain integer whatever encoding the
+        // provider used (J_INT/J_UINT/J_DOUBLE); only the J_INT case used to be
+        // shifted, so every other encoding kept a batch local index.
+        ObJsonInt *base_index_node = nullptr;
+        if (OB_FAIL(ObAIFuncJsonUtils::get_json_int(allocator, index + start_idx, base_index_node))) {
+        } else if (OB_FAIL(result_obj->add(index_key, base_index_node))) {
+        }
       }
     }
   }
@@ -381,34 +613,34 @@ int ObExprAIRerank::compact_json_array_by_key(ObIAllocator &allocator, ObJsonArr
 {
   INIT_SUCC(ret);
   ObJsonArray *result_array = nullptr;
-  if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
+  if (OB_ISNULL(array1) || OB_ISNULL(array2)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
   } else {
-    int64_t count1 = array1->element_count();
-    int64_t count2 = array2->element_count();
-    int64_t min_count = count1 < count2 ? count1 : count2;
+    const ObString index_key(INDEX_KEY);
+    const int64_t count1 = array1->element_count();
+    const int64_t count2 = array2->element_count();
     int64_t i = 0;
     int64_t j = 0;
-    while (i < min_count && j < min_count) {
-      ObJsonObject *obj1 = static_cast<ObJsonObject *>(array1->get_value(i));
-      ObJsonObject *obj2 = static_cast<ObJsonObject *>(array2->get_value(j));
-      if (OB_ISNULL(obj1) || OB_ISNULL(obj2)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        ObJsonDouble *double1 = static_cast<ObJsonDouble *>(obj1->get_value(score_key));
-        ObJsonDouble *double2 = static_cast<ObJsonDouble *>(obj2->get_value(score_key));
-        if (OB_ISNULL(double1) || OB_ISNULL(double2)) {
-          ret = OB_ERR_UNEXPECTED;
+    RerankElemKey key1;
+    RerankElemKey key2;
+    // Standard two pointer merge of the two already ordered arrays. Every
+    // element of both arrays takes part, so a batch that answers fewer elements
+    // than it was asked for (a provider truncating by top_n) can no longer hide
+    // the scores of the other batch.
+    while (i < count1 && j < count2 && OB_SUCC(ret)) {
+      get_rerank_elem_key(array1->get_value(i), score_key, index_key, key1);
+      get_rerank_elem_key(array2->get_value(j), score_key, index_key, key2);
+      if (rerank_elem_before(key2, key1)) {
+        if (OB_FAIL(result_array->append(array2->get_value(j)))) {
         } else {
-          if (double1->value() > double2->value()) {
-            if (OB_FAIL(result_array->append(obj1))) {
-            }
-            i++;
-          } else {
-            if (OB_FAIL(result_array->append(obj2))) {
-            }
-            j++;
-          }
+          j++;
         }
+      } else if (OB_FAIL(result_array->append(array1->get_value(i)))) {
+      } else {
+        // Equal keys keep the earlier batch in front: on a tie the later batch
+        // used to jump ahead and reverse the original order.
+        i++;
       }
     }
     if (OB_SUCC(ret)) {

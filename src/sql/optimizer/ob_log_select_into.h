@@ -44,7 +44,8 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        column_names_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -107,6 +108,14 @@ public:
   inline void set_external_properties(const common::ObString &external_properties)
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
+  }
+  inline void set_column_names(const common::ObString &column_names)
+  {
+    column_names_.assign_ptr(column_names.ptr(), column_names.length());
+  }
+  inline const common::ObString &get_column_names() const
+  {
+    return column_names_;
   }
   inline ObItemType get_into_type() const
   {
@@ -188,6 +197,8 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  // header line written before the data rows (COPY ... (header))
+  common::ObString column_names_;
 };
 }
 }

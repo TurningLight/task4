@@ -38,6 +38,9 @@ namespace oceanbase
 {
 namespace share
 {
+// [hipVS/cuVS] Defined below; declared here so index creation can mark a handle
+// before any row is added to it.
+static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle);
 
 ObVectorIndexInfo::ObVectorIndexInfo()
   : rowkey_vid_table_id_(common::OB_INVALID_ID),
@@ -796,6 +799,11 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                       param->bq_use_fht_))) {
         }
       }
+      if (OB_SUCC(ret)) {
+        // [hipVS/cuVS] Mark at creation: every later add_index()/search on this
+        // handle takes the GPU path, even if no row arrives before a restore.
+        ob_mark_cuvs_if_needed(algo_data_, incr_data_->index_);
+      }
       if (OB_FAIL(ret)) {
       } else if (OB_ISNULL(incr_data_->bitmap_ = static_cast<ObVectorIndexRoaringBitMap *>
                   (get_allocator()->alloc(sizeof(ObVectorIndexRoaringBitMap))))) {
@@ -884,6 +892,9 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
       }
 
       if (OB_SUCC(ret)) {
+        // [hipVS/cuVS] Mark at creation so a restored buffer (snapshot
+        // deserialize) is served by the GPU path without a later add_index().
+        ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
         snap_data_->set_inited();
         LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_), K(lbt())); // remove later
       }
@@ -941,6 +952,8 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
     }
 
     if (OB_SUCC(ret)) {
+      // [hipVS/cuVS] Mark at creation so a snapshot restore reaches the GPU path.
+      ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
       snap_data_->set_inited();
       LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_));
     }
@@ -1361,6 +1374,20 @@ int ObPluginVectorIndexAdaptor::init_sparse_vector_type()
   return ret;
 }
 
+// [hipVS/cuVS] Mark a just-populated index handle for the GPU path when the
+// vector index was declared WITH (lib=cuvs) on a dense L2 HNSW index. Idempotent.
+static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
+{
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
+  if (handle != nullptr && param != nullptr
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
+    oceanbase::common::obvsag::mark_cuvs_index(handle);
+  }
+}
+
 int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                             const int64_t vid_idx,
                                             const int64_t type_idx,
@@ -1523,6 +1550,7 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                               ))) {
         }
       } else {
+        ob_mark_cuvs_if_needed(algo_data_, incr_data_->index_);
         if (OB_FAIL(obvectorutil::add_index(incr_data_->index_,
                                               vectors,
                                               incr_vids,
@@ -1714,6 +1742,7 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
           if (!is_sparse_vector_index_type()) {
+            ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
             if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
             }
           } else {
@@ -3168,12 +3197,25 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  const ObVectorIndexParam *ser_param = static_cast<const ObVectorIndexParam *>(algo_data_);
+  const bool gpu_only_snapshot = ser_param != nullptr
+      && ser_param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS;
   if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(obvectorutil::get_index_number(snap_data_->index_, snap_index_size))) {
   } else if (snap_index_size == 0) {
-    // do nothing
-    LOG_INFO("[vec index] empty snap index, do not need to serialize");
+    LOG_INFO("[vec index] empty snap index, do not need to serialize", K(snap_index_size));
+  } else if (gpu_only_snapshot) {
+    // [GPU-only] Persist the accumulated vector/id buffer. The VSAG index is
+    // empty on this path, so the VSAG serializer would write nothing and a
+    // query served by a re-created adaptor (CREATE INDEX on pre-loaded data,
+    // restart) would see an empty snapshot.
+    if (OB_FAIL(index_seri.serialize_cuvs(snap_data_->index_, cb_param, cb))) {
+    } else {
+      // The in-memory buffer is exactly what was just written: keep rb_flag_
+      // false so a query on this adaptor does not re-read the snapshot.
+      LOG_INFO("[vec index] serialized lib=cuvs buffer snapshot", K(snap_index_size));
+    }
   } else if (OB_FAIL(index_seri.serialize(snap_data_->index_, cb_param, cb))) {
   } else {
     // for multi-version snapshot
@@ -4066,9 +4108,19 @@ int ObPluginVectorIndexAdaptor::deserialize_snap_data(ObVectorQueryConditions *q
     ObVectorIndexSerializer index_seri(tmp_allocator);
     TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
     ObString target_prefix;
+    const ObVectorIndexParam *des_param = static_cast<const ObVectorIndexParam *>(algo_data_);
+    const bool gpu_only_snapshot = des_param != nullptr
+        && des_param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS;
     if (!get_snapshot_key_prefix().empty() && key_prefix.prefix_match(get_snapshot_key_prefix()) && !snap_data_->rb_flag_) {
       // skip deserialize, already been deserialized by other concurrent thread
-    } else if (OB_FAIL(index_seri.deserialize(snap_data_->index_, param, cb))) {
+    } else if (gpu_only_snapshot && !is_mem_data_init_atomic(VIRT_SNAP)) {
+      // A lib=cuvs index restores into its buffer, so the index handle must
+      // exist before the payload is read.
+      if (OB_FAIL(init_snap_data_without_lock())) {
+      } else if (OB_FAIL(index_seri.deserialize_cuvs(snap_data_->index_, param, cb))) {
+      }
+    } else if (gpu_only_snapshot && OB_FAIL(index_seri.deserialize_cuvs(snap_data_->index_, param, cb))) {
+    } else if (!gpu_only_snapshot && OB_FAIL(index_seri.deserialize(snap_data_->index_, param, cb))) {
     } else if (OB_FAIL(obvectorutil::immutable_optimize(snap_data_->index_))) {
     } else if (OB_FALSE_IT(index_type = get_snap_index_type())) {
     } else if (OB_FAIL(ObPluginVectorIndexUtils::get_split_snapshot_prefix(index_type, key_prefix, target_prefix))) {

@@ -36,6 +36,9 @@ namespace sql
 struct JtScanCtx;
 class ObExpr;
 struct JtScanCtx;
+// pimpl for the file-scan mode: streaming scanner state, defined in the .cpp so the
+// scanner headers stay out of this header (and off the plan-scoped spec).
+struct ObFileTableScanState;
 class ObJsonTableSpec;
 class MulModeTableFunc;
 class JoinNode;
@@ -49,6 +52,7 @@ enum table_type : int8_t {
   OB_JSON_TABLE = 1,
   OB_XML_TABLE = 2,
   OB_UNNEST_TABLE = 3,
+  OB_FILE_TABLE = 4,  // read_csv / read_json / read_parquet / glob
 };
 
 typedef enum JtNodeType {
@@ -163,6 +167,12 @@ struct JtScanCtx {
     return spec_ptr_->table_type_ == OB_UNNEST_TABLE_TYPE;
   }
 
+  // read_csv / read_json / read_parquet / glob: no json document, no exec tree,
+  // rows come from a streaming file scanner owned by the operator.
+  bool is_file_table_func() {
+    return spec_ptr_->table_type_ == OB_FILE_TABLE_TYPE;
+  }
+
   ObJsonTableSpec* spec_ptr_;
   ObEvalCtx* eval_ctx_;
   ObExecContext* exec_ctx_;
@@ -194,6 +204,7 @@ public:
       is_inited_(false),
       is_evaled_(false),
       root_(nullptr),
+      file_state_(nullptr),
       input_(nullptr),
       j_null_(),
       j_arr_(allocator_),
@@ -229,6 +240,12 @@ private:
                                JoinNode*& join_col);
   int inner_get_next_row_jt();  // json table function inner
 
+  // ---- file table (read_csv / read_json / read_parquet / glob) ----
+  int open_file_scan();          // evaluate the path, open the scanner, infer schema
+  int reset_file_scan();         // rewind / reopen for rescan
+  void destroy_file_scan();      // close + free the scanner state
+  int inner_get_next_row_file(); // one scanner row -> the referenced column exprs
+
 private:
   JtColTreeNode* def_root_;
   common::ObIAllocator *allocator_;
@@ -237,6 +254,7 @@ private:
   bool is_evaled_;
   JoinNode* root_;  // mul mode table
   JtScanCtx jt_ctx_;
+  ObFileTableScanState* file_state_;  // file table mode only, owned by this operator
 
 public:
   void *input_;   // mul mode table

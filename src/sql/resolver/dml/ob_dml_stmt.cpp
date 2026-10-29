@@ -4319,7 +4319,9 @@ ObJtColBaseInfo::ObJtColBaseInfo()
     data_type_(),
     parent_id_(-1),
     id_(-1),
-    value_(0) {}
+    value_(0),
+    fs_type_name_(),
+    fs_nullable_(false) {}
 
 ObJtColBaseInfo::ObJtColBaseInfo(const ObJtColBaseInfo& info)
   : col_type_(info.col_type_),
@@ -4340,7 +4342,9 @@ ObJtColBaseInfo::ObJtColBaseInfo(const ObJtColBaseInfo& info)
     data_type_(info.data_type_),
     parent_id_(info.parent_id_),
     id_(info.id_),
-    value_(info.value_) {}
+    value_(info.value_),
+    fs_type_name_(info.fs_type_name_),
+    fs_nullable_(info.fs_nullable_) {}
 
 int ObJtColBaseInfo::deep_copy(const ObJtColBaseInfo& src, ObIAllocator* allocator) 
 {
@@ -4354,6 +4358,12 @@ int ObJtColBaseInfo::deep_copy(const ObJtColBaseInfo& src, ObIAllocator* allocat
   if (OB_SUCC(ret) && src.path_.length() > 0) {
     ObIAllocator& alloc = *allocator;
     if (OB_FAIL(ob_write_string(alloc, src.path_, path_))) {
+    }
+  }
+
+  if (OB_SUCC(ret) && src.fs_type_name_.length() > 0) {
+    ObIAllocator& alloc = *allocator;
+    if (OB_FAIL(ob_write_string(alloc, src.fs_type_name_, fs_type_name_))) {
     }
   }
 
@@ -4375,6 +4385,7 @@ int ObJtColBaseInfo::deep_copy(const ObJtColBaseInfo& src, ObIAllocator* allocat
     parent_id_ = src.parent_id_;
     id_ = src.id_;
     value_ = src.value_;
+    fs_nullable_ = src.fs_nullable_;
   }
   return ret;
 }
@@ -4402,6 +4413,8 @@ int ObJtColBaseInfo::assign(const ObJtColBaseInfo& src)
   parent_id_ = src.parent_id_;
   id_ = src.id_;
   value_ = src.value_;
+  fs_type_name_ = src.fs_type_name_;
+  fs_nullable_ = src.fs_nullable_;
 
   return ret;
 }

@@ -629,6 +629,8 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
                                       ins_ctdef.is_single_value_,
                                       dml_op))) {
     } else if (OB_FAIL(check_filter_row(ins_ctdef, dml_op.get_eval_ctx(), is_skipped))) {
+    } else if (!is_skipped
+               && OB_FAIL(AiColumnHandle::do_handle(dml_op, ins_ctdef, ins_rtdef))) {
     }
 
   }
@@ -730,6 +732,9 @@ int ObDMLService::process_delete_row(const ObDelCtDef &del_ctdef,
           dml_op, del_ctdef.das_base_ctdef_, del_ctdef.trig_ctdef_, del_rtdef.trig_rtdef_))) {
       }
     }
+    if (OB_SUCC(ret) && !is_skipped
+        && OB_FAIL(AiColumnHandle::do_handle(dml_op, del_ctdef, del_rtdef))) {
+    }
     LOG_DEBUG("process delete row", K(ret), K(is_skipped),
                "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), del_ctdef.old_row_));
   }
@@ -814,6 +819,12 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
         } else {
           ret = OB_ERR_CHECK_CONSTRAINT_VIOLATED;
         }
+      }
+      // The handler also needs to run when the row itself did not change:
+      // RETRY AI COLUMN may set an already NULL result to NULL, which still
+      // has to create a task and mark the row PENDING.
+      if (OB_SUCC(ret) && !is_skipped
+          && OB_FAIL(AiColumnHandle::do_handle(dml_op, upd_ctdef, upd_rtdef))) {
       }
     }
   } else {

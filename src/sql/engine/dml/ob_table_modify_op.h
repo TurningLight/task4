@@ -98,6 +98,67 @@ private:
                              const ObForeignKeyArg &fk_arg, bool &is_self_ref);
 };
 
+// Maintains AI column task rows for user DML.  Tasks are written through an
+// inner SQL connection so that they share the user transaction: they are
+// visible inside the transaction and disappear on rollback.
+class AiColumnHandle
+{
+public:
+  static int do_handle(ObTableModifyOp &op,
+                       const ObDMLBaseCtDef &dml_ctdef,
+                       ObDMLBaseRtDef &dml_rtdef);
+  // Executes invalidation statements collected during row processing.  Called
+  // after the DAS buffer of the statement has been written to storage.
+  static int execute_pending_invalidations(ObTableModifyOp &op);
+private:
+  static int handle_insert(ObTableModifyOp &op,
+                           const share::schema::ObTableSchema &table_schema,
+                           const ObInsCtDef &ins_ctdef);
+  static int handle_update(ObTableModifyOp &op,
+                           const share::schema::ObTableSchema &table_schema,
+                           const ObUpdCtDef &upd_ctdef);
+  static int handle_delete(ObTableModifyOp &op,
+                           const share::schema::ObTableSchema &table_schema,
+                           const ObDelCtDef &del_ctdef);
+  static int collect_ai_columns(const share::schema::ObTableSchema &table_schema,
+                                common::ObIArray<const share::schema::ObColumnSchemaV2 *> &ai_columns);
+  static int collect_depend_columns(const share::schema::ObTableSchema &table_schema,
+                                    const common::ObString &expr,
+                                    common::ObIArray<uint64_t> &depend_column_ids);
+  static bool is_column_updated(const ObDASUpdCtDef &upd_ctdef, const uint64_t column_id);
+  static bool is_rowkey_updated(const share::schema::ObTableSchema &table_schema,
+                                share::schema::ObSchemaGetterGuard *schema_guard,
+                                const ObDASUpdCtDef &upd_ctdef);
+  static int collect_pk_column_ids(const share::schema::ObTableSchema &table_schema,
+                                   share::schema::ObSchemaGetterGuard *schema_guard,
+                                   common::ObIArray<uint64_t> &column_ids);
+  static int find_column_index(const common::ObIArray<uint64_t> &column_ids,
+                               const uint64_t column_id,
+                               int64_t &idx);
+  static int set_column_datum_null(const ObExprPtrIArray &row, const int64_t idx, ObEvalCtx &eval_ctx);
+  static int set_column_datum_string(const ObExprPtrIArray &row, const int64_t idx,
+                                     ObEvalCtx &eval_ctx, common::ObIAllocator &alloc,
+                                     const common::ObString &value);
+  static int gen_rowkey_predicate(ObTableModifyOp &op,
+                                  const share::schema::ObTableSchema &table_schema,
+                                  const common::ObIArray<uint64_t> &column_ids,
+                                  const ObExprPtrIArray &row,
+                                  common::ObIAllocator &alloc,
+                                  common::ObString &predicate);
+  static int gen_request_id(common::ObIAllocator &alloc, common::ObString &request_id);
+  static int insert_tasks(ObTableModifyOp &op,
+                          const share::schema::ObTableSchema &table_schema,
+                          const common::ObIArray<const share::schema::ObColumnSchemaV2 *> &ai_columns,
+                          const common::ObString &request_id,
+                          const common::ObString &predicate);
+  static int delete_tasks(ObTableModifyOp &op,
+                          const uint64_t table_id,
+                          const common::ObString &predicate);
+  static int exec_nested_sql(ObTableModifyOp &op,
+                             const common::ObIArray<common::ObString> &sqls,
+                             const bool skip_cur_stmt_tables);
+};
+
 class ObTableModifyOp;
 class ObTableModifySpec : public ObOpSpec
 {
@@ -231,6 +292,11 @@ public:
   int end_nested_session();
   int execute_write(const char *sql);
   int execute_read(const char *sql, common::ObMySQLProxy::MySQLResult &res);
+  int add_ai_invalidate_sql(const common::ObString &sql)
+  { return ai_invalidate_sqls_.push_back(sql); }
+  common::ObIArray<common::ObString> &get_ai_invalidate_sqls()
+  { return ai_invalidate_sqls_; }
+  void clear_ai_invalidate_sqls() { ai_invalidate_sqls_.reuse(); }
   int check_stack();
   bool is_nested_session() { return ObSQLUtils::is_nested_sql(&ctx_); }
   bool is_fk_nested_session() { return ObSQLUtils::is_fk_nested_sql(&ctx_); }
@@ -302,6 +368,7 @@ public:
   common::sqlclient::ObISQLConnectionGuard inner_conn_guard_;
   ObIInnerSQLConnection *inner_conn_;
   ObIInnerSQLConnection::SavedValue saved_conn_;
+  common::ObSEArray<common::ObString, 4> ai_invalidate_sqls_;
   bool need_foreign_key_check_;
   bool need_close_conn_;
 

@@ -1412,6 +1412,7 @@ int ObDmlCgService::append_upd_old_row_cid(ObLogicalOperator &op,
   return ret;
 }
 
+
 int ObDmlCgService::generate_minimal_upd_old_row_cid(ObLogDelUpd &op,
                                                      ObTableID index_tid,
                                                      ObDASUpdCtDef &das_upd_ctdef,

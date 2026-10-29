@@ -716,7 +716,17 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObPluginVectorIndexAdapt
           ret = OB_ERR_UNEXPECTED;
         } else {
           TCWLockGuard lock_guard(snap_memdata->mem_data_rwlock_);
-          if (OB_FAIL(index_seri.deserialize(snap_memdata->index_, param, cb))) {
+          // [GPU-only] A lib=cuvs index persists its vector/id buffer instead of
+          // a VSAG graph; restore it into the buffer (no CPU index on this path).
+          ObVectorIndexParam *sync_param = static_cast<ObVectorIndexParam *>(new_adapter->get_algo_data());
+          const bool gpu_only_snapshot = sync_param != nullptr
+              && sync_param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS;
+          if (gpu_only_snapshot && !new_adapter->is_mem_data_init_atomic(VIRT_SNAP)) {
+            if (OB_FAIL(new_adapter->init_snap_data_without_lock())) {
+            } else if (OB_FAIL(index_seri.deserialize_cuvs(snap_memdata->index_, param, cb))) {
+            }
+          } else if (gpu_only_snapshot && OB_FAIL(index_seri.deserialize_cuvs(snap_memdata->index_, param, cb))) {
+          } else if (!gpu_only_snapshot && OB_FAIL(index_seri.deserialize(snap_memdata->index_, param, cb))) {
           } else if (OB_FAIL(obvectorutil::immutable_optimize(snap_memdata->index_))) {
           } else if (OB_FALSE_IT(index_type = new_adapter->get_snap_index_type())) {
           } else if (OB_FAIL(get_split_snapshot_prefix(index_type, key_prefix, target_prefix))) {

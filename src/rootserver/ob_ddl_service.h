@@ -222,6 +222,10 @@ public:
       common::ObIArray<share::schema::ObTableSchema> *global_idx_schema_array = NULL);
   int redistribute_column_ids(
       ObTableSchema &new_table_schema);
+  int add_ai_hidden_columns_for_alter(share::schema::ObTableSchema &new_table_schema,
+                                        share::schema::AlterColumnSchema &ai_column,
+                                        ObDDLOperator *ddl_operator,
+                                        common::ObMySQLTransaction *trans);
   int add_new_column_to_table_schema(
       const share::schema::ObTableSchema &origin_table_schema,
       const share::schema::AlterTableSchema &alter_table_schema,

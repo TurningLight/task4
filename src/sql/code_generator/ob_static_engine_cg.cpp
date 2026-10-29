@@ -121,6 +121,69 @@ int ObStaticEngineCG::generate(const ObLogPlan &log_plan, ObPhysicalPlan &phy_pl
   phy_plan_ = &phy_plan;
   opt_ctx_ = &log_plan.get_optimizer_context();
   ObOpSpec *root_spec = NULL;
+  // Collect AI columns referenced by the statement for strict read checks.
+  {
+    ObSEArray<uint64_t, 4> ai_table_ids;
+    ObSEArray<uint64_t, 4> ai_column_ids;
+    const ObIArray<ObRawExpr *> &all_exprs = opt_ctx_->get_all_exprs().get_expr_array();
+    ObSchemaGetterGuard *schema_guard = opt_ctx_->get_schema_guard();
+    const ObDMLStmt *root_stmt = opt_ctx_->get_root_stmt();
+    const ObSQLSessionInfo *session_info = opt_ctx_->get_session_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < all_exprs.count(); ++i) {
+      ObRawExpr *expr = all_exprs.at(i);
+      if (OB_ISNULL(expr) || T_REF_COLUMN != expr->get_expr_type()) {
+        // not a plain column reference
+      } else {
+        ObColumnRefRawExpr *col_expr = static_cast<ObColumnRefRawExpr *>(expr);
+        const ObTableSchema *table_schema = nullptr;
+        const ObColumnSchemaV2 *col_schema = nullptr;
+        const TableItem *table_item = nullptr;
+        if (OB_ISNULL(schema_guard)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_NOT_NULL(root_stmt)
+                   && OB_NOT_NULL(table_item = root_stmt->get_table_item_by_id(
+                                       col_expr->get_table_id()))) {
+          if (OB_FAIL(schema_guard->get_table_schema(table_item->ref_id_,
+                                                     table_schema))) {
+            ret = OB_SUCCESS;
+          }
+        } else if (OB_NOT_NULL(session_info) && !col_expr->get_table_name().empty()) {
+          ObString db_name = col_expr->get_database_name();
+          if (db_name.empty()) {
+            db_name = session_info->get_database_name();
+          }
+          if (!db_name.empty()) {
+            if (OB_FAIL(schema_guard->get_table_schema(db_name, col_expr->get_table_name(),
+                                                       false, table_schema))) {
+              ret = OB_SUCCESS;
+            }
+          }
+        }
+        if (OB_SUCC(ret) && OB_NOT_NULL(table_schema)) {
+          if (OB_ISNULL(col_schema = table_schema->get_column_schema(
+                                     col_expr->get_column_name()))) {
+            // virtual columns may have no schema entry
+          } else if (!col_schema->is_ai_column()) {
+            // not an AI column
+          } else {
+            const uint64_t table_id = table_schema->get_table_id();
+            const uint64_t column_id = col_schema->get_column_id();
+            bool exists = false;
+            for (int64_t j = 0; !exists && j < ai_column_ids.count(); ++j) {
+              exists = (ai_table_ids.at(j) == table_id && ai_column_ids.at(j) == column_id);
+            }
+            if (!exists
+                && (OB_FAIL(ai_table_ids.push_back(table_id))
+                    || OB_FAIL(ai_column_ids.push_back(column_id)))) {
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !ai_column_ids.empty()
+        && OB_FAIL(phy_plan.set_ai_column_refs(ai_table_ids, ai_column_ids))) {
+    }
+  }
   if (OB_INVALID_ID != log_plan.get_max_op_id()) {
 #ifndef NDEBUG
     phy_plan.bit_set_.reset();
@@ -5458,6 +5521,8 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_closed_cht(), spec.closed_cht_))) {
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_escaped_cht(), spec.escaped_cht_))) {
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
+  } else if (!op.get_column_names().empty()
+             && OB_FAIL(spec.column_names_.store_str(op.get_column_names()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
   } else {

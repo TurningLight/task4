@@ -6034,6 +6034,15 @@ int ObRawExprUtils::check_need_cast_expr(const ObRawExprResType &src_type,
     if (src_type.is_decimal_int() && dst_type.is_number()) {
       // ignore duplicate cast error caused by decimal int fallback to number
       ignore_dup_cast_error = true;
+    } else if (ob_is_integer_type(in_type) && ob_is_integer_type(out_type)) {
+      // Integer-to-integer conversion is closed under composition: casting an
+      // already implicitly-cast integer child to another integer type produces
+      // the same value as casting the child directly. Type deduction can reach
+      // this shape legitimately, e.g. IFNULL(boolean_scalar_subquery, !(!(a LIKE b)))
+      // where the subquery was wrapped by an inner-added cast before the NVL
+      // promotion picked the wider integer type. Rejecting it aborted the query
+      // with -4016 instead of returning rows.
+      ignore_dup_cast_error = true;
     }
   }
   return ret;

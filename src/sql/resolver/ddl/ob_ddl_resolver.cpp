@@ -2084,6 +2084,12 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
     for (int64_t i = 0; OB_SUCC(ret) && i < attrs_node->num_child_; ++i) {
       ParseNode *attr_node = attrs_node->children_[i];
       switch (attr_node->type_) {
+      case T_AI_COLUMN_ATTR: {
+        if (OB_FAIL(resolve_ai_column_attribute(column, attr_node))) {
+          SQL_RESV_LOG(WARN, "resolve ai column attribute failed", K(ret));
+        }
+        break;
+      }
       case T_CONSTR_NOT_NULL: {
         if (OB_FAIL(resolve_normal_column_attribute_constr_not_null(column, attr_node, resolve_stat))) {
         }
@@ -8073,6 +8079,140 @@ int ObDDLResolver::get_partition_keys_by_part_func_expr(
         ret = OB_ERR_PARSE_SQL;
       } else {
         pos += wc.length();
+      }
+    }
+  }
+  return ret;
+}
+
+
+
+int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column, ParseNode *ai_attr_node)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(ai_attr_node) || T_AI_COLUMN_ATTR != ai_attr_node->type_
+      || 2 != ai_attr_node->num_child_ || OB_ISNULL(ai_attr_node->children_[0])) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_RESV_LOG(WARN, "invalid ai column attr node", K(ret));
+  } else {
+    ParseNode *expr = ai_attr_node->children_[0];
+    bool is_ai_complete = false;
+    bool is_ai_embed = false;
+    if (OB_ISNULL(expr) || T_FUN_SYS != expr->type_ || expr->num_child_ < 2
+        || OB_ISNULL(expr->children_[0])) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN expression other than AI_COMPLETE/AI_EMBED");
+    } else {
+      ObString fn_name(static_cast<int32_t>(expr->children_[0]->str_len_),
+                       expr->children_[0]->str_value_);
+      is_ai_complete = (0 == fn_name.case_compare("AI_COMPLETE"));
+      is_ai_embed = (0 == fn_name.case_compare("AI_EMBED"));
+    }
+    if (OB_SUCC(ret) && !is_ai_complete && !is_ai_embed) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN expression other than AI_COMPLETE/AI_EMBED");
+    }
+    if (OB_SUCC(ret)) {
+      column.set_is_ai_column(true);
+      int32_t max_retries = 0;
+      bool has_sync_mode = false;
+      ParseNode *opts = ai_attr_node->children_[1];
+      while (OB_SUCC(ret) && NULL != opts) {
+        ParseNode *one = (T_LINK_NODE == opts->type_) ? opts->children_[0] : opts;
+        if (NULL != one && T_AI_COLUMN_OPTION == one->type_ && 2 == one->num_child_
+            && NULL != one->children_[0] && NULL != one->children_[1]) {
+          ObString key(static_cast<int32_t>(one->children_[0]->str_len_), one->children_[0]->str_value_);
+          ParseNode *val = one->children_[1];
+          if (0 == key.case_compare("sync_mode")) {
+            if (NULL != val && T_VARCHAR == val->type_) {
+              ObString mode(static_cast<int32_t>(val->str_len_), val->str_value_);
+              if (0 != mode.case_compare("async")) {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN sync_mode other than async");
+              } else {
+                has_sync_mode = true;
+                if (OB_FAIL(column.set_ai_sync_mode(mode))) {
+                  SQL_RESV_LOG(WARN, "set ai sync mode failed", K(ret));
+                }
+              }
+            }
+          } else if (0 == key.case_compare("max_retries")) {
+            if (NULL != val && T_INT == val->type_) {
+              max_retries = static_cast<int32_t>(val->value_);
+            }
+          }
+        }
+        opts = (T_LINK_NODE == opts->type_ && opts->num_child_ > 1) ? opts->children_[1] : NULL;
+      }
+      if (OB_SUCC(ret) && !has_sync_mode) {
+        // AI COLUMN is async-only; default to async when WITH clause is omitted.
+        ObString default_mode("async");
+        if (OB_FAIL(column.set_ai_sync_mode(default_mode))) {
+          SQL_RESV_LOG(WARN, "set default ai sync mode failed", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        column.set_ai_max_retries(max_retries);
+        ObSqlString buf;
+        const ObObjType ai_type = column.get_data_type();
+        const char *type_prompt = NULL;
+        if (ob_is_json_tc(ai_type)) {
+          type_prompt = " Return exactly one valid JSON value";
+        } else if (ob_is_integer_type(ai_type)) {
+          type_prompt = " Return exactly one base-10 integer";
+        } else if (ob_is_float_tc(ai_type) || ob_is_double_tc(ai_type)
+                   || ob_is_number_tc(ai_type)) {
+          type_prompt = " Return exactly one number";
+        }
+        if (OB_FAIL(buf.append_fmt("%.*s", static_cast<int32_t>(expr->str_len_), expr->str_value_))) {
+        } else if (NULL != type_prompt && OB_FAIL(buf.append(type_prompt))) {
+        } else if (OB_FAIL(column.set_ai_normalized_expr(buf.string()))) {
+        }
+      }
+      if (OB_SUCC(ret) && is_ai_embed
+          && ob_is_collection_sql_type(column.get_data_type())) {
+        int64_t col_dim = -1;
+        const ObIArray<ObString> &info = column.get_extended_type_info();
+        if (info.count() > 0) {
+          const ObString &t = info.at(0);
+          const char *prefix = "VECTOR(";
+          const int64_t plen = strlen(prefix);
+          int64_t start = -1;
+          for (int64_t i = 0; i + plen <= t.length(); ++i) {
+            if (0 == strncasecmp(t.ptr() + i, prefix, plen)) {
+              start = i + plen;
+              break;
+            }
+          }
+          if (start > 0) {
+            col_dim = 0;
+            bool has_digit = false;
+            for (int64_t i = start; i < t.length() && t[i] >= '0' && t[i] <= '9'; ++i) {
+              col_dim = col_dim * 10 + (t[i] - '0');
+              has_digit = true;
+            }
+            if (!has_digit) {
+              col_dim = -1;
+            }
+          }
+        }
+        int64_t arg_dim = -1;
+        {
+          ParseNode *arg_list = expr->children_[1];
+          if (NULL != arg_list && T_EXPR_LIST == arg_list->type_) {
+            if (arg_list->num_child_ > 2 && NULL != arg_list->children_[2]
+                && T_INT == arg_list->children_[2]->type_) {
+              arg_dim = arg_list->children_[2]->value_;
+            }
+          } else if (NULL != arg_list && T_INT == arg_list->type_) {
+            arg_dim = arg_list->value_;
+          }
+        }
+        if (col_dim > 0 && arg_dim > 0 && col_dim != arg_dim) {
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM, static_cast<uint32_t>(col_dim),
+                         static_cast<uint32_t>(arg_dim));
+        }
       }
     }
   }

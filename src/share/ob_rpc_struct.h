@@ -1189,6 +1189,9 @@ public:
       need_rebuild_trigger_(false),
       foreign_key_checks_(true),
       is_add_to_scheduler_(false),
+      is_retry_ai_column_(false),
+      retry_ai_column_name_(),
+      retry_ai_column_where_(),
       local_session_var_(&allocator_),
       alter_algorithm_(INPLACE),
       rebuild_index_arg_list_(),
@@ -1295,6 +1298,10 @@ public:
   bool need_rebuild_trigger_;
   bool foreign_key_checks_;
   bool is_add_to_scheduler_;
+  // ALTER TABLE ... RETRY AI COLUMN
+  bool is_retry_ai_column_;
+  common::ObString retry_ai_column_name_;
+  common::ObString retry_ai_column_where_;
   share::ObLocalSessionVar local_session_var_;
   AlterAlgorithm alter_algorithm_;
   common::ObSArray<ObTableSchema> rebuild_index_arg_list_;

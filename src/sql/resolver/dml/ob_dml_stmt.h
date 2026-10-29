@@ -47,6 +47,7 @@ enum MulModeTableType {
   OB_ORA_JSON_TABLE_TYPE, // 1
   OB_ORA_XML_TABLE_TYPE = 2,
   OB_UNNEST_TABLE_TYPE = 3,
+  OB_FILE_TABLE_TYPE = 4,  // read_csv/read_json/read_parquet/glob
 };
 
 typedef struct ObJtColBaseInfo
@@ -79,12 +80,19 @@ typedef struct ObJtColBaseInfo
       int32_t reserved_ : 31;
     };
   };
+  // File table only (read_csv/read_json/read_parquet/glob): the DuckDB spelling of
+  // the inferred column type ("BOOLEAN", "BIGINT", ...) plus the nullability inferred
+  // by the file scanner. Both remain empty/false for every other json table, which
+  // is also how the DESCRIBE path tells a file table column apart.
+  ObString fs_type_name_;
+  bool fs_nullable_;
 
   int deep_copy(const ObJtColBaseInfo& src, ObIAllocator* allocator);
   int assign(const ObJtColBaseInfo& src);
 
   TO_STRING_KV(K_(col_type), K_(format_json), K_(wrapper), K_(allow_scalar),
-   K_(output_column_idx), K_(col_name), K_(path), K_(parent_id), K_(id));
+   K_(output_column_idx), K_(col_name), K_(path), K_(parent_id), K_(id),
+   K_(fs_type_name), K_(fs_nullable));
 } ObJtColBaseInfo;
 
 typedef struct ObJsonTableDef {
@@ -190,6 +198,7 @@ struct TableItem
     JSON_TABLE,
     VALUES_TABLE,
     LATERAL_TABLE,
+    FILE_TABLE,
   };
 
   /**
@@ -222,7 +231,8 @@ struct TableItem
   bool is_has_sample_info() const { return sample_info_ != nullptr; }
   bool is_joined_table() const { return JOINED_TABLE == type_; }
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
-  bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
+  bool is_file_table() const { return FILE_TABLE == type_; }
+  bool is_json_table() const { return JSON_TABLE == type_ || FILE_TABLE == type_; }  // FILE_TABLE 复用 json table 的规划/执行链路  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }

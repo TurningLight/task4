@@ -282,6 +282,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"field_enclosed_by", FIELD_ENCLOSED_BY},
   {"field_optionally_enclosed_by", FIELD_OPTIONALLY_ENCLOSED_BY},
   {"field_delimiter", FIELD_DELIMITER},
+  {"delimiter", FIELD_DELIMITER},
   {"file", FILEX},
   {"file_extension", FILE_EXTENSION},
   {"file_id", FILE_ID},
@@ -958,6 +959,12 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"INCONSISTENT", INCONSISTENT},
   {"INDIVIDUAL", INDIVIDUAL},
   {"hybrid_search", HYBRID_SEARCH},
+  {"read_csv", READ_CSV},
+  {"read_json", READ_JSON},
+  {"read_parquet", READ_PARQUET},
+  {"glob", GLOB},
+  {"HEADER", HEADER},
+  {"NULLSTR", NULLSTR},
 };
 
 /** https://dev.mysql.com/doc/refman/5.7/en/sql-syntax-prepared-statements.html

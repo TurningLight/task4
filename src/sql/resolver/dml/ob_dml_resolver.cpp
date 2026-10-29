@@ -41,6 +41,9 @@
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
+#include "sql/engine/basic/file/ob_csv_scanner.h"
+#include "sql/engine/basic/file/ob_jsonl_scanner.h"
+#include "sql/engine/basic/file/ob_parquet_reader.h"
 
 namespace oceanbase
 {
@@ -2701,6 +2704,11 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         OZ (resolve_function_table_item(*table_node, table_item));
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
+        }
+        break;
+      }
       case T_JSON_TABLE_EXPRESSION: {
         OZ (resolve_json_table_item(*table_node, table_item));
         break;
@@ -3762,6 +3770,448 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
 
   if (OB_SUCC(ret) && OB_NOT_NULL(params_.query_ctx_)) {
     params_.query_ctx_->has_hybrid_search_ = true;
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_file_table_args(const ParseNode &name_node,
+                                         const ParseNode &args_node)
+{
+  int ret = OB_SUCCESS;
+  ObString func_name;
+  func_name.assign_ptr(name_node.str_value_, static_cast<int32_t>(name_node.str_len_));
+  const bool is_glob = (0 == func_name.case_compare("glob"));
+  int64_t positional = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < args_node.num_child_; ++i) {
+    const ParseNode *arg = args_node.children_[i];
+    if (OB_ISNULL(arg)) {
+      ret = OB_ERR_PARSER_SYNTAX;
+    } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_
+               && NULL != arg->children_[0]) {
+      // 命名参数：sample_size 只支持 -1；其余已知参数交给执行层校验
+      ObString key;
+      if (NULL != arg->children_[0]->str_value_ && arg->children_[0]->str_len_ > 0) {
+        key.assign_ptr(arg->children_[0]->str_value_,
+                       static_cast<int32_t>(arg->children_[0]->str_len_));
+      } else {
+        key.assign_ptr(arg->str_value_, static_cast<int32_t>(arg->str_len_));
+      }
+      const bool is_sample_size = (0 == key.case_compare("sample_size"));
+      const bool known = is_sample_size
+                         || 0 == key.case_compare("header")
+                         || 0 == key.case_compare("format")
+                         || 0 == key.case_compare("nullstr")
+                         || 0 == key.case_compare("columns");
+      if (!known) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table named argument is not supported");
+      } else if (!is_sample_size) {
+        // header / format / nullstr / columns：取值由执行层校验
+      } else {
+        // sample_size 只接受 -1。注意 -1 在文法里不是负数字面量，
+        // 而是 T_OP_NEG 包一个 T_INT(1)，必须单独展开。
+        char buf[32];
+        int64_t len = 0;
+        const ParseNode *v = arg->children_[1];
+        if (NULL != v && T_INT == v->type_ && NULL != v->str_value_) {
+          len = snprintf(buf, sizeof(buf), "%.*s",
+                         v->str_len_, v->str_value_);
+        } else if (NULL != v && 1 == v->num_child_ && NULL != v->children_[0]
+                   && T_INT == v->children_[0]->type_
+                   && NULL != v->children_[0]->str_value_) {
+          len = snprintf(buf, sizeof(buf), "-%.*s",
+                         v->children_[0]->str_len_, v->children_[0]->str_value_);
+        }
+        if (len <= 0 || 0 != strcmp(buf, "-1")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size = -1 is supported");
+        }
+      }
+    } else if (NULL != arg->str_value_ && arg->str_len_ > 0) {
+      ++positional;
+      if (positional >= 2 && !is_glob) {
+        ObString fmt;
+        fmt.assign_ptr(arg->str_value_, static_cast<int32_t>(arg->str_len_));
+        if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("auto")
+            && 0 != fmt.case_compare("json") && 0 != fmt.case_compare("newline_delimited")) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL,
+                         "You have an error in your SQL syntax; check the manual that "
+                         "corresponds to your OceanBase version for the right syntax to use",
+                         (int)fmt.length(), fmt.ptr(), 1);
+        }
+      }
+    } else {
+      ++positional;
+    }
+  }
+  return ret;
+}
+
+
+// FILE_SQL_SCHEMA_INFER: 把文件内容推断成列元数据（resolve 阶段执行）
+//
+// A string column must carry a real collation: ObObjMeta::set_type() leaves
+// cs_type_/cs_level_ at CS_TYPE_INVALID/CS_LEVEL_INVALID for string types, and
+// everything downstream (optimizer, code generator, expr frames) rejects a
+// string type whose collation is invalid.
+static inline void fs_set_varchar_meta(common::ObDataType &dt)
+{
+  dt.set_obj_type(ObVarcharType);
+  dt.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType]);
+  dt.set_charset_type(ObCharset::get_default_charset());
+  dt.set_collation_level(CS_LEVEL_IMPLICIT);
+  dt.set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
+}
+
+static int fs_map_csv_type(const ObCsvType t, common::ObDataType &dt)
+{
+  int ret = OB_SUCCESS;
+  switch (t) {
+    case OB_CSV_TYPE_BIGINT:
+      dt.set_obj_type(ObIntType);
+      dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObIntType]);
+      break;
+    case OB_CSV_TYPE_DOUBLE:
+      dt.set_obj_type(ObDoubleType);
+      // NOT_FIXED_SCALE, like a plain `double` column: MAX_ACCURACY would render
+      // every value with 30 fractional digits ("98.500000..."), which is not what
+      // a MySQL client shows for a double column.
+      dt.set_accuracy(ObAccuracy());
+      break;
+    case OB_CSV_TYPE_BOOLEAN:
+      dt.set_obj_type(ObTinyIntType);
+      dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObTinyIntType]);
+      break;
+    case OB_CSV_TYPE_DATE:
+      dt.set_obj_type(ObDateType);
+      dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObDateType]);
+      break;
+    case OB_CSV_TYPE_DATETIME:
+      dt.set_obj_type(ObDateTimeType);
+      // DATETIME(0), like a plain `datetime` column; MAX_ACCURACY is fsp=6 and
+      // would append a spurious ".000000".
+      dt.set_accuracy(ObAccuracy(19, 0));
+      break;
+    case OB_CSV_TYPE_VARCHAR:
+    case OB_CSV_TYPE_SQL_NULL:
+    default:
+      fs_set_varchar_meta(dt);
+      break;
+  }
+  return ret;
+}
+
+// DuckDB spelling of the inferred file table column type. It is kept beside the
+// type mapping so that `DESCRIBE <select>` can report the spelling DuckDB produces
+// (e.g. BOOLEAN) even though the session type is ObTinyIntType.
+static const char *fs_csv_type_name(const ObCsvType t)
+{
+  switch (t) {
+    case OB_CSV_TYPE_BIGINT: return "BIGINT";
+    case OB_CSV_TYPE_DOUBLE: return "DOUBLE";
+    case OB_CSV_TYPE_BOOLEAN: return "BOOLEAN";
+    case OB_CSV_TYPE_DATE: return "DATE";
+    case OB_CSV_TYPE_DATETIME: return "DATETIME";
+    case OB_CSV_TYPE_VARCHAR:
+    case OB_CSV_TYPE_SQL_NULL:
+    default: return "VARCHAR";
+  }
+}
+
+static const char *fs_jsonl_type_name(const ObJsonlType t)
+{
+  switch (t) {
+    case OB_JSONL_TYPE_BIGINT: return "BIGINT";
+    case OB_JSONL_TYPE_DOUBLE: return "DOUBLE";
+    case OB_JSONL_TYPE_BOOLEAN: return "BOOLEAN";
+    default: return "VARCHAR";
+  }
+}
+
+static int fs_push_type_name(ObIAllocator &allocator,
+                             const char *name,
+                             ObIArray<ObString> &col_type_names)
+{
+  int ret = OB_SUCCESS;
+  ObString str;
+  if (OB_ISNULL(name)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ob_write_string(allocator, ObString::make_string(name), str))) {
+  } else if (OB_FAIL(col_type_names.push_back(str))) {
+  }
+  return ret;
+}
+
+static int fs_infer_schema(const ObString &func_name,
+                           const ObString &path,
+                           bool has_header,
+                           int64_t sample_size,
+                           ObIAllocator &allocator,
+                           ObIArray<ObString> &col_names,
+                           ObIArray<common::ObDataType> &col_types,
+                           ObIArray<ObString> &col_type_names,
+                           ObIArray<bool> &col_nullables)
+{
+  int ret = OB_SUCCESS;
+  std::string spath(path.ptr(), static_cast<size_t>(path.length()));
+  std::string err;
+  const bool is_json = (0 == func_name.case_compare("read_json"));
+  const bool is_parquet = (0 == func_name.case_compare("read_parquet"));
+  const bool is_glob = (0 == func_name.case_compare("glob"));
+  if (is_glob) {
+    ObString n;
+    OZ (ob_write_string(allocator, ObString::make_string("file"), n));
+    OZ (col_names.push_back(n));
+    common::ObDataType dt;
+    fs_set_varchar_meta(dt);
+    OZ (col_types.push_back(dt));
+    OZ (fs_push_type_name(allocator, "VARCHAR", col_type_names));
+    OZ (col_nullables.push_back(true));
+  } else if (is_parquet) {
+    obparquet::Reader reader;
+    if (!reader.Open(spath, &err)) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("open parquet failed", K(err.c_str()));
+    } else {
+      for (size_t i = 0; OB_SUCC(ret) && i < reader.columns().size(); ++i) {
+        const obparquet::ColumnInfo &ci = reader.columns()[i];
+        ObString n;
+        OZ (ob_write_string(allocator,
+                            ObString(static_cast<int32_t>(ci.name.size()), ci.name.c_str()), n));
+        OZ (col_names.push_back(n));
+        common::ObDataType dt;
+        const char *type_name = "VARCHAR";
+        switch (ci.physical_type) {
+          case obparquet::PT_INT32:
+            dt.set_obj_type(ObIntType);
+            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObIntType]);
+            type_name = "INTEGER";
+            break;
+          case obparquet::PT_INT64:
+            dt.set_obj_type(ObIntType);
+            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObIntType]);
+            type_name = "BIGINT";
+            break;
+          case obparquet::PT_DOUBLE:
+          case obparquet::PT_FLOAT:
+            dt.set_obj_type(ObDoubleType);
+            dt.set_accuracy(ObAccuracy());  // NOT_FIXED_SCALE, see fs_map_csv_type
+            type_name = "DOUBLE";
+            break;
+          default:
+            fs_set_varchar_meta(dt);
+            break;
+        }
+        OZ (col_types.push_back(dt));
+        OZ (fs_push_type_name(allocator, type_name, col_type_names));
+        // parquet RepetitionType: REQUIRED(0) is the only non nullable one
+        OZ (col_nullables.push_back(0 != ci.repetition_type));
+      }
+      reader.Close();
+    }
+  } else if (is_json) {
+    ObJsonlScanner scanner;
+    scanner.set_sample_size(sample_size);
+    if (!scanner.open(spath, &err)) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("open jsonl failed", K(err.c_str()));
+    } else if (!scanner.infer_schema(&err)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("infer jsonl schema failed", K(err.c_str()));
+    } else {
+      const std::vector<ObJsonlColumnSchema> &sc = scanner.schema();
+      for (size_t i = 0; OB_SUCC(ret) && i < sc.size(); ++i) {
+        ObString n;
+        OZ (ob_write_string(allocator,
+                            ObString(static_cast<int32_t>(sc[i].name.size()), sc[i].name.c_str()), n));
+        OZ (col_names.push_back(n));
+        common::ObDataType dt;
+        switch (sc[i].type) {
+          case OB_JSONL_TYPE_BIGINT:
+            dt.set_obj_type(ObIntType);
+            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObIntType]);
+            break;
+          case OB_JSONL_TYPE_DOUBLE:
+            dt.set_obj_type(ObDoubleType);
+            dt.set_accuracy(ObAccuracy());  // NOT_FIXED_SCALE, see fs_map_csv_type
+            break;
+          case OB_JSONL_TYPE_BOOLEAN:
+            dt.set_obj_type(ObTinyIntType);
+            dt.set_accuracy(ObAccuracy::MAX_ACCURACY[ObTinyIntType]);
+            break;
+          default:
+            fs_set_varchar_meta(dt);
+            break;
+        }
+        OZ (col_types.push_back(dt));
+        OZ (fs_push_type_name(allocator, fs_jsonl_type_name(sc[i].type), col_type_names));
+        OZ (col_nullables.push_back(sc[i].nullable));
+      }
+      scanner.close();
+    }
+  } else {
+    ObCsvScanner scanner;
+    scanner.set_header(has_header);
+    scanner.set_sample_size(sample_size);
+    if (!scanner.open(spath, &err)) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("open csv failed", K(err.c_str()));
+    } else if (!scanner.infer_schema(&err)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("infer csv schema failed", K(err.c_str()));
+    } else {
+      const std::vector<ObCsvColumnSchema> &sc = scanner.schema();
+      for (size_t i = 0; OB_SUCC(ret) && i < sc.size(); ++i) {
+        ObString n;
+        OZ (ob_write_string(allocator,
+                            ObString(static_cast<int32_t>(sc[i].name.size()), sc[i].name.c_str()), n));
+        OZ (col_names.push_back(n));
+        common::ObDataType dt;
+        OZ (fs_map_csv_type(sc[i].type, dt));
+        OZ (col_types.push_back(dt));
+        OZ (fs_push_type_name(allocator, fs_csv_type_name(sc[i].type), col_type_names));
+        OZ (col_nullables.push_back(sc[i].nullable));
+      }
+      scanner.close();
+    }
+  }
+  return ret;
+}
+
+
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
+                                           TableItem *&tbl_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObDMLStmt *stmt = get_stmt();
+  tbl_item = NULL;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(T_FILE_TABLE_EXPRESSION != parse_tree.type_
+                         || 3 != parse_tree.num_child_
+                         || OB_ISNULL(parse_tree.children_[0])
+                         || OB_ISNULL(parse_tree.children_[1]))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "file sql is disabled, set session enable_file_sql = ON first");
+  } else if (OB_FAIL(check_file_table_args(*parse_tree.children_[0],
+                                           *parse_tree.children_[1]))) {
+  } else {
+    const ParseNode *args = parse_tree.children_[1];
+    const ParseNode *path_node = (args->num_child_ > 0) ? args->children_[0] : NULL;
+    bool has_header = true;
+    int64_t sample_size = -1;
+    ObString func_name;
+    func_name.assign_ptr(parse_tree.children_[0]->str_value_,
+                         static_cast<int32_t>(parse_tree.children_[0]->str_len_));
+    for (int64_t i = 1; i < args->num_child_; ++i) {
+      const ParseNode *a = args->children_[i];
+      if (NULL == a || T_OP_EQ != a->type_ || 2 != a->num_child_) {
+        continue;
+      }
+      const ParseNode *k = a->children_[0];
+      const ParseNode *v = a->children_[1];
+      if (NULL == k || NULL == v || NULL == k->str_value_) {
+        continue;
+      }
+      ObString key(k->str_len_, k->str_value_);
+      if (0 == key.case_compare("header")) {
+        if (NULL != v->str_value_ && v->str_len_ > 0) {
+          ObString vv(v->str_len_, v->str_value_);
+          has_header = (0 == vv.case_compare("true") || 0 == vv.case_compare("1"));
+        } else {
+          has_header = (0 != v->value_);
+        }
+      } else if (0 == key.case_compare("sample_size") && v->num_child_ == 0
+                 && NULL != v->str_value_) {
+        int64_t val = 0;
+        std::string num(v->str_value_, static_cast<size_t>(v->str_len_));
+        if (0 == ob_atoll(num.c_str(), val)) {
+          sample_size = val;
+        }
+      }
+    }
+    if (NULL == path_node || NULL == path_node->str_value_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file path must be a constant string");
+    } else {
+      ObString path(path_node->str_len_, path_node->str_value_);
+      ObSEArray<ObString, 8> names;
+      ObSEArray<common::ObDataType, 8> types;
+      ObSEArray<ObString, 8> type_names;
+      ObSEArray<bool, 8> nullables;
+      if (OB_FAIL(fs_infer_schema(func_name, path, has_header, sample_size,
+                                  *allocator_, names, types, type_names, nullables))) {
+      } else if (0 == names.count()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("file table has no column", K(path));
+      } else {
+        TableItem *item = NULL;
+        ObJsonTableDef *table_def = NULL;
+        ObString tbl_name;
+        ObRawExpr *path_expr = NULL;
+        void *def_buf = NULL;
+        if (OB_ISNULL(def_buf = allocator_->alloc(sizeof(ObJsonTableDef)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (FALSE_IT(table_def = new (def_buf) ObJsonTableDef())) {
+        } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (NULL != parse_tree.children_[2]
+                   && NULL != parse_tree.children_[2]->str_value_) {
+          tbl_name.assign_ptr(parse_tree.children_[2]->str_value_,
+                              static_cast<int32_t>(parse_tree.children_[2]->str_len_));
+        } else if (OB_FAIL(stmt->generate_json_table_name(*allocator_, tbl_name))) {
+        }
+        // 文件路径作为常量表达式放进 doc_exprs_，运行时由算子取用
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(resolve_sql_expr(*path_node, path_expr))) {
+          } else if (OB_ISNULL(path_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(table_def->doc_exprs_.push_back(path_expr))) {
+          } else {
+            table_def->table_type_ = MulModeTableType::OB_FILE_TABLE_TYPE;
+          }
+        }
+        if (OB_SUCC(ret)) {
+          item->table_id_ = generate_table_id();
+          item->table_name_ = tbl_name;
+          item->alias_name_ = tbl_name;
+          item->type_ = TableItem::FILE_TABLE;
+          item->is_view_table_ = false;
+          item->json_table_def_ = table_def;
+          if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+          }
+          for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+            ObJtColBaseInfo *col_info = NULL;
+            ColumnItem *col_item = NULL;
+            void *cbuf = NULL;
+            if (OB_ISNULL(cbuf = allocator_->alloc(sizeof(ObJtColBaseInfo)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else if (FALSE_IT(col_info = new (cbuf) ObJtColBaseInfo())) {
+            } else if (FALSE_IT(col_info->col_name_ = names.at(i))) {
+            } else if (FALSE_IT(col_info->data_type_ = types.at(i))) {
+            } else if (FALSE_IT(col_info->id_ = static_cast<int32_t>(OB_APP_MIN_COLUMN_ID + i))) {
+            } else if (FALSE_IT(col_info->output_column_idx_ = OB_APP_MIN_COLUMN_ID + i)) {
+            } else if (FALSE_IT(col_info->fs_type_name_ = type_names.at(i))) {
+            } else if (FALSE_IT(col_info->fs_nullable_ = nullables.at(i))) {
+            } else if (OB_FAIL(generate_json_table_output_column_item(
+                                 item, types.at(i), names.at(i),
+                                 OB_APP_MIN_COLUMN_ID + i, col_item))) {
+            } else if (FALSE_IT(col_item->col_idx_ = table_def->all_cols_.count())) {
+            } else if (OB_FAIL(table_def->all_cols_.push_back(col_info))) {
+            }
+          }
+          if (OB_SUCC(ret)) {
+            tbl_item = item;
+          }
+        }
+      }
+    }
   }
   return ret;
 }

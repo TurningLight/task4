@@ -239,6 +239,49 @@ int ObVectorIndexSerializer::deserialize(void *&index, ObIStreamBuf::CbParam &cb
   return ret;
 }
 
+int ObVectorIndexSerializer::serialize_cuvs(void *index, ObOStreamBuf::CbParam &cb_param, ObOStreamBuf::Callback &cb, const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  char *data = nullptr;
+  if (OB_ISNULL(index) || 0 > capacity) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(data = static_cast<char*>(allocator_.alloc(capacity * sizeof(char))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ObOStreamBuf streambuf(data, capacity, cb_param, cb);
+    std::ostream out(&streambuf);
+    if (OB_FAIL(obvectorutil::cuvs_serialize(index, out))) {
+      if (streambuf.get_error_code() != OB_SUCCESS && streambuf.get_error_code() != OB_ITER_END) {
+        ret = streambuf.get_error_code();
+      }
+    } else {
+      streambuf.check_finish(); // flush the tail so every byte reaches a row
+      if (OB_FAIL(streambuf.get_error_code())) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorIndexSerializer::deserialize_cuvs(void *&index, ObIStreamBuf::CbParam &cb_param, ObIStreamBuf::Callback &cb)
+{
+  int ret = OB_SUCCESS;
+  ObIStreamBuf streambuf(nullptr, 0, cb_param, cb);
+  std::istream in(&streambuf);
+  if (OB_FAIL(streambuf.init())) {
+    if (ret == OB_ITER_END) {
+      LOG_INFO("[vec index deserialize] cuvs snapshot table is empty, just return");
+      ret = OB_SUCCESS;
+    }
+  } else if (OB_FAIL(obvectorutil::cuvs_deserialize(index, in))) {
+    const int stream_ret = streambuf.get_error_code();
+    if (stream_ret != OB_SUCCESS && stream_ret != OB_ITER_END) {
+      LOG_WARN("[vec index deserialize] cuvs snapshot read failed", K(ret), K(stream_ret));
+    }
+  }
+  return ret;
+}
+
 int ObHNSWDeserializeCallback::operator()(char*& data, const int64_t data_size, int64_t &read_size, share::ObIStreamBuf::CbParam &cb_param)
 {
   UNUSED(data_size);

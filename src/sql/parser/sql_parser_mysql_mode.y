@@ -259,6 +259,7 @@ END_P SET_VAR DELIMITER
 //-----------------------------reserved keyword end-------------------------------------------------
 %token <non_reserved_keyword>
 //-----------------------------non_reserved keyword begin-------------------------------------------
+        HEADER NULLSTR
         ACCESS ACCOUNT ACTION ACTIVE ADDDATE AFTER AGAINST AGGREGATE AI ALGORITHM ALWAYS ALLOW ANALYSE ANY
         APPROX_COUNT_DISTINCT APPROX_COUNT_DISTINCT_SYNOPSIS APPROX_COUNT_DISTINCT_SYNOPSIS_MERGE
         ARRAY ASCII ASIS AT ATTRIBUTE AUTHORS AUTO AUTOEXTEND_SIZE AUTO_INCREMENT AUTO_INCREMENT_CACHE_SIZE
@@ -371,7 +372,7 @@ END_P SET_VAR DELIMITER
 
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
-%type <node> sql_stmt stmt_list stmt opt_end_p
+%type <node> sql_stmt stmt_list stmt opt_end_p opt_ai_column_with_options ai_column_option_list ai_column_option
 %type <node> select_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
@@ -399,6 +400,7 @@ END_P SET_VAR DELIMITER
 %type <node> replace_with_opt_hint insert_with_opt_hint column_list opt_on_duplicate_key_clause opt_into opt_replace opt_temporary no_param_column_ref
 %type <node> insert_vals_list insert_vals value_or_values opt_insert_row_alias
 %type <node> select_with_parens select_no_parens select_clause select_into no_table_select_with_order_and_limit simple_select_with_order_and_limit select_with_parens_with_order_and_limit select_clause_set_with_order_and_limit
+%type <node> copy_stmt copy_options_opt copy_option_list copy_option copy_option_value
 %type <node> simple_select no_table_select limit_clause select_expr_list opt_approx
 %type <node> with_select with_clause with_list common_table_expr opt_column_alias_name_list alias_name_list column_alias_name
 %type <node> opt_where opt_hint_value opt_groupby opt_rollup opt_order_by order_by opt_having groupby_clause order_by_opt_null
@@ -497,6 +499,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%token <non_reserved_keyword> READ_CSV READ_JSON READ_PARQUET GLOB
+%type <node> file_table_expr file_func_name file_func_arg_list file_func_arg
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -556,6 +560,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -6139,7 +6144,12 @@ column_attribute_list column_attribute
 }
 
 column_attribute:
-not NULLX
+AI COLUMN '(' expr ')' opt_ai_column_with_options
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ATTR, 2, $4, $6);
+}
+| not NULLX
 {
   (void)($1) ;
   (void)($2) ; /* make bison mute */
@@ -8903,6 +8913,98 @@ LIMIT limit_expr OFFSET limit_expr
 }
 ;
 
+/* COPY (query) TO 'file' [(options)] -- MySQL/PostgreSQL style data export.
+ *
+ * The statement is rewritten into the existing SELECT ... INTO OUTFILE form:
+ * the inner query parse tree is returned as the statement node and carries a
+ * T_COPY_INTO node in PARSE_SELECT_INTO_EXTRA.  The resolver converts it into
+ * an ObSelectIntoItem with a CSV ObExternalFileFormat, so no new executor is
+ * needed.  T_COPY_INTO has two children: the outfile path, and a T_LINK_NODE
+ * holding the format option nodes (NULL when no option is given). */
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_options_opt
+{
+  ParseNode *copy_into = NULL;
+  malloc_non_terminal_node(copy_into, result->malloc_pool_, T_COPY_INTO, 2, $6, $7);
+  $$ = $3;
+  if (OB_ISNULL($$)) {
+    yyerror(&@1, result, "COPY expects a query");
+    YYABORT_UNEXPECTED;
+  } else if (T_SELECT != $$->type_) {
+    yyerror(&@1, result, "COPY expects a query");
+    YYERROR;
+  } else if (NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY query can not contain an INTO clause");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = copy_into;
+  }
+}
+;
+
+copy_options_opt:
+/* empty */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  ParseNode *copy_options = NULL;
+  merge_nodes(copy_options, result, T_LINK_NODE, $2);
+  $$ = copy_options;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list opt_comma copy_option
+{
+  (void) ($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| HEADER
+{
+  ParseNode *enable_header = NULL;
+  malloc_terminal_node(enable_header, result->malloc_pool_, T_BOOL);
+  enable_header->value_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, enable_header);
+}
+| HEADER opt_equal_mark BOOL_VALUE
+{
+  (void) ($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, $3);
+}
+| NULLSTR STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, $2);
+}
+| FIELD_DELIMITER copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $2);
+}
+;
+
+copy_option_value:
+NAME_OB
+{
+  $$ = $1;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+;
+
 into_clause:
 INTO OUTFILE STRING_VALUE opt_charset field_opt line_opt file_opt
 {
@@ -10830,6 +10932,10 @@ tbl_name
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALIAS, 6, $2, unname_node, unname_node, unname_node, unname_node, $3);
   unname_node->sql_str_off_ = @2.first_column;
   $$->value_ = 1; //lateral
+}
+| file_table_expr
+{
+  $$ = $1;
 }
 | json_table_expr
 {
@@ -14692,7 +14798,22 @@ alter_table_action
 ;
 
 alter_table_action:
-opt_set table_option_list_space_seperated
+NAME_OB AI COLUMN column_name opt_where
+{
+  if (NULL == $1 || 5 != $1->str_len_
+      || 0 != strncasecmp($1->str_value_, "retry", 5)) {
+    yyerror(&@1, result, "expected RETRY keyword");
+  } else {
+    ParseNode *retry_node = NULL;
+    malloc_non_terminal_node(retry_node, result->malloc_pool_,
+                             T_RETRY_AI_COLUMN, 2, $4, $5);
+    if (NULL != $5) {
+      dup_expr_string(retry_node, result, @5.first_column, @5.last_column);
+    }
+    $$ = retry_node;
+  }
+}
+| opt_set table_option_list_space_seperated
 {
   (void)$1;
   merge_nodes($$, result, T_TABLE_OPTION_LIST, $2);
@@ -17479,6 +17600,58 @@ literal
 }
 ;
 
+file_func_name:
+READ_CSV
+{
+  make_name_node($$, result->malloc_pool_, "read_csv");
+}
+| READ_JSON
+{
+  make_name_node($$, result->malloc_pool_, "read_json");
+}
+| READ_PARQUET
+{
+  make_name_node($$, result->malloc_pool_, "read_parquet");
+}
+| GLOB
+{
+  make_name_node($$, result->malloc_pool_, "glob");
+}
+;
+
+file_func_arg_list:
+file_func_arg
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_func_arg_list ',' file_func_arg
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_func_arg:
+expr
+{
+  $$ = $1;
+}
+;
+
+file_table_expr:
+file_func_name '(' file_func_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| file_func_name '(' file_func_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| file_func_name '(' file_func_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}
@@ -17491,7 +17664,9 @@ unreserved_keyword_normal { $$=$1;}
 ;
 
 unreserved_keyword_normal:
-ACCOUNT
+HEADER
+|       NULLSTR
+|       ACCOUNT
 |       ACTION
 |       ACTIVE
 |       ADDDATE
@@ -18181,6 +18356,10 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       READ_CSV
+|       READ_JSON
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:
@@ -18433,6 +18612,35 @@ ACCESSIBLE
 | XOR
 | YEAR_MONTH
 | ZEROFILL
+opt_ai_column_with_options:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  $$ = $3;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+NAME_OB COMP_EQ expr_or_default
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, $1, $3);
+}
+;
+
 %%
 ////////////////////////////////////////////////////////////////
 void yyerror(void *yylloc, ParseResult *p, char *s, ...)
