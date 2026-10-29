@@ -1082,7 +1082,8 @@ int ObPluginVectorIndexUtils::init_common_scan_param(storage::ObTableScanParam& 
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(get_special_index_aux_table_column_count(type,
                                                                 table_id, col_cnt, scan_param))) {
-      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to get special index aux table column count",
+               K(ret), K(type), K(table_id), K(col_cnt));
     }
   }
 
