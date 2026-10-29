@@ -79,14 +79,18 @@ int ObHybridSearchExecutor::execute_search(ObObj &query_res) {
   } else if (OB_FAIL(do_get_sql(search_arg_.search_params_, query_sql, true))) {
   } else if (OB_ISNULL(sql_proxy = ctx_->get_sql_proxy())) {
     ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null, hybrid search can not build inner sql connection",
+             K(ret), KP(ctx_));
   } else if (OB_FAIL(
                  query::ObInnerSQLConnectionAccess::
                      create_spi_connection_with_external_session(
                          session_info_, conn_guard))) {
   } else if (OB_ISNULL(base_conn = conn_guard.get_ptr())) {
     ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("spi connection handle is null after create", K(ret), KP(session_info_));
   } else if (OB_ISNULL(conn = sql::as_inner_sql_connection(base_conn))) {
     ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to cast spi connection to inner sql connection", K(ret), KP(base_conn));
   } else {
     // This connection runs user search SQL on the caller's external session.
     // Nested-session state isolation does not provide SELECT authorization.
