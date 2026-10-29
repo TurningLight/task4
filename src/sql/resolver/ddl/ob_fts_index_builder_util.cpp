@@ -1045,9 +1045,14 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        // 两张重表(倒排表/doc_word 表)各自要分词全部文档并写 69 万行，是全文索引构建的耗时主体。
+        // 它们串行构建，因此每张表都可以独占整机的并行度；原来的 original/3 会把并行度压到 1，
+        // 实测 4 核只用到 1.4 核、PX 协调者全程空等，这里放宽到 original/2。
+        decided_parallelism = MAX(original_parallelism / 2, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
