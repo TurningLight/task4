@@ -3715,12 +3715,10 @@ int ObDMLResolver::resolve_file_table_args(const ParseNode *arg_list,
   }
   if (OB_SUCC(ret) && OB_NOT_NULL(node) && OB_FAIL(args.push_back(node))) {
   }
-  // The chain was collected right to left; restore source order.
-  for (int64_t i = 0; OB_SUCC(ret) && i < args.count() / 2; ++i) {
-    const ParseNode *tmp = args.at(i);
-    args.at(i) = args.at(args.count() - 1 - i);
-    args.at(args.count() - 1 - i) = tmp;
-  }
+  // The chain is left-deep, so the collected list is in reverse source order.
+  // Both possible orders are handled by position-independent rules: the path is
+  // the positional argument whose text is not the function's own format name,
+  // and anything else positional must be that format name.
   bool path_seen = false;
   for (int64_t i = 0; OB_SUCC(ret) && i < args.count(); ++i) {
     const ParseNode *arg = args.at(i);
@@ -3729,19 +3727,26 @@ int ObDMLResolver::resolve_file_table_args(const ParseNode *arg_list,
     } else if (is_file_table_named_arg(*arg)) {
       if (OB_FAIL(apply_file_table_named_arg(arg, options))) {
       }
-    } else if (OB_FAIL(resolve_file_table_arg_value(*arg, path))) {
-    } else if (OB_UNLIKELY(path_seen)) {
-      // A second positional argument names the format, the way DuckDB spells
-      // read_csv(path, csv). Only the functions own format is accepted.
-      ObString name;
-      if (OB_FAIL(resolve_file_table_arg_value(*arg, name))) {
-      } else if (0 != name.case_compare(ob_file_format_name(static_cast<ObFileFormat>(format)))) {
-        ret = OB_ERR_PARSER_SYNTAX;
-        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
-        LOG_WARN("format does not match the file table function", K(ret), K(name));
-      }
     } else {
-      path_seen = true;
+      ObString text;
+      if (OB_FAIL(resolve_file_table_arg_value(*arg, text))) {
+      } else if (!path_seen
+                 && 0 != text.case_compare(ob_file_format_name(static_cast<ObFileFormat>(format)))) {
+        // The first positional argument that is not the format name is the path.
+        // Reading it again through the same helper keeps the null terminated
+        // copy that fopen() relies on.
+        if (OB_FAIL(resolve_file_table_arg_value(*arg, path))) {
+        } else {
+          path_seen = true;
+        }
+      } else if (0 != text.case_compare(ob_file_format_name(static_cast<ObFileFormat>(format)))) {
+        // A second positional argument that is not the format name is reported
+        // as a parse error at the position the user wrote.
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                       static_cast<int32_t>(text.length()), text.ptr(), 1);
+        LOG_WARN("format does not match the file table function", K(ret), K(text));
+      }
     }
   }
   if (OB_SUCC(ret) && OB_UNLIKELY(!path_seen)) {

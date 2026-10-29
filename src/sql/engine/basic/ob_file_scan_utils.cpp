@@ -552,9 +552,17 @@ int read_csv_row(const char *&cursor, const char *end,
             ++cursor;
           }
         } else {
-          if (OB_FAIL(field.append(allocator, c))) {
+          // A CRLF inside a quoted field is one line break. Keeping the CR
+          // would make the value depend on the file's line endings.
+          if (c == '\r' && cursor + 1 < end && *(cursor + 1) == '\n') {
+            if (OB_FAIL(field.append(allocator, '\n'))) {
+            } else {
+              cursor += 2;
+            }
+          } else if (OB_FAIL(field.append(allocator, c))) {
+          } else {
+            ++cursor;
           }
-          ++cursor;
         }
       } else if (c == options.quote_ && !field.started_) {
         in_quotes = true;
